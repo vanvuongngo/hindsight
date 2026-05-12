@@ -33,7 +33,7 @@ services:
       - hindsight-net
 
   hindsight:
-    image: ghcr.io/vectorize-io/hindsight:${HINDSIGHT_VERSION:-latest}
+    image: ghcr.io/vectorize-io/hindsight:${HINDSIGHT_VERSION:-0.6.1}
     container_name: hindsight-app
     restart: unless-stopped
     ports:
