@@ -495,6 +495,7 @@ describe("agent_end hook", () => {
     const [, content] = retainSpy.mock.calls[0];
     const parsed = JSON.parse(content);
     expect(parsed).toEqual([
+      { role: "system", content: "[context]\nsender: U013\nprovider: telegram\n[/context]" },
       { role: "user", content: [{ type: "text", text: "I love TypeScript." }] },
       { role: "assistant", content: [{ type: "text", text: "TypeScript is great!" }] },
     ]);
@@ -542,7 +543,7 @@ describe("agent_end hook", () => {
     expect(options?.metadata?.channel_id).toBe("chat-999");
     expect(options?.metadata?.sender_id).toBe("U015");
     expect(options?.metadata?.retained_at).toBeDefined();
-    expect(options?.metadata?.message_count).toBe("1");
+    expect(options?.metadata?.message_count).toBe("2");
   });
 
   it("uses identity cached in before_dispatch for retain metadata when agent_end ctx is sparse", async () => {
@@ -694,10 +695,136 @@ describe("agent_end hook", () => {
     // Default retainFormat is 'json' with Anthropic-shaped typed blocks.
     const parsed = JSON.parse(content);
     expect(parsed).toEqual([
+      { role: "system", content: "[context]\nsender: U019\nprovider: telegram\n[/context]" },
       { role: "user", content: [{ type: "text", text: "I work as a data scientist." }] },
       { role: "assistant", content: [{ type: "text", text: "That's a fascinating career!" }] },
     ]);
     expect(content).not.toContain("My name is Carol.");
-    expect(options?.metadata?.message_count).toBe("2");
+    expect(options?.metadata?.message_count).toBe("3");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// session_end hook (#1726) — force-flush of un-retained turns on session close
+// ---------------------------------------------------------------------------
+
+describe("session_end hook (#1726)", () => {
+  // Separate handle so we can configure retainEveryNTurns > 1; the shared
+  // beforeAll uses retainEveryNTurns: 1 which never skips any turn.
+  let triggerSessionEnd: MockApiHandle["trigger"];
+
+  beforeAll(async () => {
+    if (!apiReachable) return;
+
+    const mod = await import("../src/index.js");
+    const handle = createMockApi({
+      hindsightApiUrl: HINDSIGHT_API_URL,
+      dynamicBankId: true,
+      retainEveryNTurns: 5,
+      retainOverlapTurns: 0,
+    });
+    triggerSessionEnd = handle.trigger;
+    mod.default(handle.api);
+    await handle.startServices();
+  }, 30_000);
+
+  it("flushes un-retained turns when session_end fires before the cadence boundary", async () => {
+    if (!apiReachable) return;
+    retainSpy.mockResolvedValue(OK_RETAIN);
+
+    // 2 agent_end ticks with retainEveryNTurns=5 — neither hits the cadence
+    // boundary, so retain should not yet have been called.
+    await triggerSessionEnd(
+      "agent_end",
+      {
+        success: true,
+        messages: [{ role: "user", content: "I just adopted a corgi named Pepper." }],
+      },
+      { messageProvider: "telegram", senderId: "U1726A", sessionKey: "sess-1726-short" }
+    );
+    await triggerSessionEnd(
+      "agent_end",
+      {
+        success: true,
+        messages: [
+          { role: "user", content: "I just adopted a corgi named Pepper." },
+          { role: "assistant", content: "Pepper sounds adorable!" },
+          { role: "user", content: "She loves chasing tennis balls." },
+        ],
+      },
+      { messageProvider: "telegram", senderId: "U1726A", sessionKey: "sess-1726-short" }
+    );
+
+    expect(retainSpy).not.toHaveBeenCalled();
+
+    // session_end should force-flush the un-retained turns.
+    await triggerSessionEnd(
+      "session_end",
+      {
+        messages: [
+          { role: "user", content: "I just adopted a corgi named Pepper." },
+          { role: "assistant", content: "Pepper sounds adorable!" },
+          { role: "user", content: "She loves chasing tennis balls." },
+        ],
+      },
+      { messageProvider: "telegram", senderId: "U1726A", sessionKey: "sess-1726-short" }
+    );
+
+    expect(retainSpy).toHaveBeenCalledOnce();
+    const [, content] = retainSpy.mock.calls[0];
+    expect(content).toContain("Pepper");
+  });
+
+  it("is a no-op when session_end fires on a cadence boundary (already retained)", async () => {
+    if (!apiReachable) return;
+    retainSpy.mockResolvedValue(OK_RETAIN);
+
+    // 5 turns triggers cadence retain at turn 5.
+    for (let i = 1; i <= 5; i++) {
+      await triggerSessionEnd(
+        "agent_end",
+        {
+          success: true,
+          messages: Array.from({ length: i }, (_, j) => ({
+            role: j % 2 === 0 ? "user" : "assistant",
+            content: `turn ${j + 1} message about hiking`,
+          })),
+        },
+        { messageProvider: "telegram", senderId: "U1726B", sessionKey: "sess-1726-aligned" }
+      );
+    }
+
+    expect(retainSpy).toHaveBeenCalledOnce();
+    retainSpy.mockReset();
+    retainSpy.mockResolvedValue(OK_RETAIN);
+
+    // session_end after the boundary: nothing un-retained, must not duplicate.
+    await triggerSessionEnd(
+      "session_end",
+      {
+        messages: Array.from({ length: 5 }, (_, j) => ({
+          role: j % 2 === 0 ? "user" : "assistant",
+          content: `turn ${j + 1} message about hiking`,
+        })),
+      },
+      { messageProvider: "telegram", senderId: "U1726B", sessionKey: "sess-1726-aligned" }
+    );
+
+    expect(retainSpy).not.toHaveBeenCalled();
+  });
+
+  it("is a no-op when session_end fires for a session with no agent_end turns", async () => {
+    if (!apiReachable) return;
+    retainSpy.mockResolvedValue(OK_RETAIN);
+
+    await triggerSessionEnd(
+      "session_end",
+      {
+        messages: [{ role: "user", content: "ephemeral message that never reached agent_end" }],
+      },
+      { messageProvider: "telegram", senderId: "U1726C", sessionKey: "sess-1726-empty" }
+    );
+
+    expect(retainSpy).not.toHaveBeenCalled();
   });
 });

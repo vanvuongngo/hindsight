@@ -287,7 +287,7 @@ enum BankCommands {
         /// Bank ID
         bank_id: String,
 
-        /// Filter by fact type (world, experience, opinion)
+        /// Filter by fact type (world, experience, observation)
         #[arg(short = 't', long)]
         fact_type: Option<String>,
 
@@ -455,7 +455,7 @@ enum MemoryCommands {
         /// Bank ID
         bank_id: String,
 
-        /// Filter by fact type (world, experience, opinion)
+        /// Filter by fact type (world, experience, observation)
         #[arg(short = 't', long)]
         fact_type: Option<String>,
 
@@ -489,8 +489,8 @@ enum MemoryCommands {
         /// Search query
         query: String,
 
-        /// Fact types to search (world, experience, opinion)
-        #[arg(short = 't', long, value_delimiter = ',', default_values = &["world", "experience", "opinion"])]
+        /// Fact types to search (world, experience, observation)
+        #[arg(short = 't', long, value_delimiter = ',', default_values = &["world", "experience", "observation"])]
         fact_type: Vec<String>,
 
         /// Thinking budget (low, mid, high)
@@ -591,6 +591,12 @@ enum MemoryCommands {
         #[arg(short = 'c', long)]
         context: Option<String>,
 
+        /// When the content occurred (ISO 8601 datetime, e.g. 2024-01-15T10:30:00Z
+        /// or 2024-01-15). Pass "unset" to store without a timestamp.
+        /// Omit to default to now.
+        #[arg(short = 't', long)]
+        timestamp: Option<String>,
+
         /// Queue for background processing
         #[arg(long)]
         r#async: bool,
@@ -639,8 +645,8 @@ enum MemoryCommands {
         /// Bank ID
         bank_id: String,
 
-        /// Fact type to clear (world, agent, opinion). If not specified, clears all types.
-        #[arg(short = 't', long, value_parser = ["world", "agent", "opinion"])]
+        /// Fact type to clear (world, experience, observation). If not specified, clears all types.
+        #[arg(short = 't', long, value_parser = ["world", "experience", "observation"])]
         fact_type: Option<String>,
 
         /// Skip confirmation prompt
@@ -1434,6 +1440,7 @@ fn run() -> Result<()> {
                 content,
                 doc_id,
                 context,
+                timestamp,
                 r#async,
                 document_tags,
             } => commands::memory::retain(
@@ -1442,6 +1449,7 @@ fn run() -> Result<()> {
                 content,
                 doc_id,
                 context,
+                timestamp,
                 r#async,
                 document_tags,
                 verbose,
