@@ -59,6 +59,9 @@ import type {
   ExportBankTemplateData,
   ExportBankTemplateErrors,
   ExportBankTemplateResponses,
+  ExportDocumentsData,
+  ExportDocumentsErrors,
+  ExportDocumentsResponses,
   FileRetainData,
   FileRetainErrors,
   FileRetainResponses,
@@ -116,6 +119,9 @@ import type {
   ImportBankTemplateData,
   ImportBankTemplateErrors,
   ImportBankTemplateResponses,
+  ImportDocumentsData,
+  ImportDocumentsErrors,
+  ImportDocumentsResponses,
   ListAuditLogsData,
   ListAuditLogsErrors,
   ListAuditLogsResponses,
@@ -134,12 +140,18 @@ import type {
   ListEntitiesData,
   ListEntitiesErrors,
   ListEntitiesResponses,
+  ListLlmRequestsData,
+  ListLlmRequestsErrors,
+  ListLlmRequestsResponses,
   ListMemoriesData,
   ListMemoriesErrors,
   ListMemoriesResponses,
   ListMentalModelsData,
   ListMentalModelsErrors,
   ListMentalModelsResponses,
+  ListObservationScopesData,
+  ListObservationScopesErrors,
+  ListObservationScopesResponses,
   ListOperationsData,
   ListOperationsErrors,
   ListOperationsResponses,
@@ -152,6 +164,9 @@ import type {
   ListWebhooksData,
   ListWebhooksErrors,
   ListWebhooksResponses,
+  LlmRequestStatsData,
+  LlmRequestStatsErrors,
+  LlmRequestStatsResponses,
   MetricsEndpointMetricsGetData,
   MetricsEndpointMetricsGetResponses,
   RecallMemoriesData,
@@ -181,6 +196,9 @@ import type {
   RetryOperationData,
   RetryOperationErrors,
   RetryOperationResponses,
+  TestBankLlmData,
+  TestBankLlmErrors,
+  TestBankLlmResponses,
   TriggerConsolidationData,
   TriggerConsolidationErrors,
   TriggerConsolidationResponses,
@@ -199,6 +217,9 @@ import type {
   UpdateDocumentData,
   UpdateDocumentErrors,
   UpdateDocumentResponses,
+  UpdateMemoryData,
+  UpdateMemoryErrors,
+  UpdateMemoryResponses,
   UpdateMentalModelData,
   UpdateMentalModelErrors,
   UpdateMentalModelResponses,
@@ -266,7 +287,7 @@ export const metricsEndpointMetricsGet = <ThrowOnError extends boolean = false>(
 /**
  * Get memory graph data
  *
- * Retrieve graph data for visualization, optionally filtered by type (world/experience/opinion).
+ * Retrieve graph data for visualization, optionally filtered by type (world/experience/observation).
  */
 export const getGraph = <ThrowOnError extends boolean = false>(
   options: Options<GetGraphData, ThrowOnError>
@@ -300,6 +321,23 @@ export const getMemory = <ThrowOnError extends boolean = false>(
   (options.client ?? client).get<GetMemoryResponses, GetMemoryErrors, ThrowOnError>({
     url: "/v1/default/banks/{bank_id}/memories/{memory_id}",
     ...options,
+  });
+
+/**
+ * Curate memory unit
+ *
+ * Edit a memory's text and/or change its curation state (invalidate / revert). Invalidated memories are excluded from recall, consolidation, and graph maintenance but kept for audit (reversible). Only world/experience facts can be curated; observations are derived.
+ */
+export const updateMemory = <ThrowOnError extends boolean = false>(
+  options: Options<UpdateMemoryData, ThrowOnError>
+) =>
+  (options.client ?? client).patch<UpdateMemoryResponses, UpdateMemoryErrors, ThrowOnError>({
+    url: "/v1/default/banks/{bank_id}/memories/{memory_id}",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
   });
 
 /**
@@ -340,12 +378,12 @@ export const recallMemories = <ThrowOnError extends boolean = false>(
 /**
  * Reflect and generate answer
  *
- * Reflect and formulate an answer using bank identity, world facts, and opinions.
+ * Reflect and formulate an answer using bank identity, world facts, observations, and mental models.
  *
  * This endpoint:
  * 1. Retrieves experience (conversations and events)
  * 2. Retrieves world facts relevant to the query
- * 3. Retrieves existing opinions (bank's perspectives)
+ * 3. Retrieves observations and mental models (bank's synthesized perspectives)
  * 4. Uses LLM to formulate a contextual answer
  * 5. Returns plain text answer and the facts used
  */
@@ -384,6 +422,19 @@ export const getAgentStats = <ThrowOnError extends boolean = false>(
 ) =>
   (options.client ?? client).get<GetAgentStatsResponses, GetAgentStatsErrors, ThrowOnError>({
     url: "/v1/default/banks/{bank_id}/stats",
+    ...options,
+  });
+
+/**
+ * Test the bank's LLM connectivity
+ *
+ * Probe the LLMs this bank would use for retain / consolidation / reflect with one minimal call each (configs shared across operations are probed once), so you can discover 'not configured / unreachable' instead of a silent stall. Deliberate action (makes a real provider call); not for polling. Returns status only — never the provider, model, endpoint, API key, or raw error. Disable with HINDSIGHT_API_ENABLE_BANK_LLM_HEALTH=false.
+ */
+export const testBankLlm = <ThrowOnError extends boolean = false>(
+  options: Options<TestBankLlmData, ThrowOnError>
+) =>
+  (options.client ?? client).post<TestBankLlmResponses, TestBankLlmErrors, ThrowOnError>({
+    url: "/v1/default/banks/{bank_id}/health/llm",
     ...options,
   });
 
@@ -967,6 +1018,37 @@ export const exportBankTemplate = <ThrowOnError extends boolean = false>(
   >({ url: "/v1/default/banks/{bank_id}/export", ...options });
 
 /**
+ * Export documents
+ *
+ * Export documents (extracted facts, entity names, causal links, chunks) from a bank as a transfer ZIP archive. Embeddings and database ids are not included — importing re-embeds with the target bank's model and re-resolves entities. Consolidated observations are excluded unless include_observations=true. Pass document_id query params to export specific documents, or omit to export the whole bank.
+ */
+export const exportDocuments = <ThrowOnError extends boolean = false>(
+  options: Options<ExportDocumentsData, ThrowOnError>
+) =>
+  (options.client ?? client).get<ExportDocumentsResponses, ExportDocumentsErrors, ThrowOnError>({
+    url: "/v1/default/banks/{bank_id}/document-transfer",
+    ...options,
+  });
+
+/**
+ * Import documents (async)
+ *
+ * Submit a transfer archive (produced by the export endpoint) for import into a bank. Runs as a background operation: facts are re-embedded with the target bank's embedding model and entities are re-resolved — no LLM extraction. Returns an operation_id; poll GET /v1/default/banks/{bank_id}/operations/{operation_id} for status and the imported/skipped counts in result_metadata. Use on_conflict to control existing document ids: skip (default), replace, or new-id.
+ */
+export const importDocuments = <ThrowOnError extends boolean = false>(
+  options: Options<ImportDocumentsData, ThrowOnError>
+) =>
+  (options.client ?? client).post<ImportDocumentsResponses, ImportDocumentsErrors, ThrowOnError>({
+    ...formDataBodySerializer,
+    url: "/v1/default/banks/{bank_id}/document-transfer",
+    ...options,
+    headers: {
+      "Content-Type": null,
+      ...options.headers,
+    },
+  });
+
+/**
  * Get bank template JSON Schema
  *
  * Returns the JSON Schema for the bank template manifest format. Use this to validate template manifests before importing.
@@ -992,6 +1074,20 @@ export const clearObservations = <ThrowOnError extends boolean = false>(
     ClearObservationsErrors,
     ThrowOnError
   >({ url: "/v1/default/banks/{bank_id}/observations", ...options });
+
+/**
+ * List observation scopes
+ *
+ * Enumerate the distinct scopes across a bank's observations. Each observation lives under a scope: the exact set of tags it was consolidated with. Returns every distinct scope (tag order normalized) with the number of observations in it; the empty tag list is the global/untagged scope. Use a returned scope with the graph endpoint (tags=<scope> & tags_match=exact) to filter observations to exactly that scope.
+ */
+export const listObservationScopes = <ThrowOnError extends boolean = false>(
+  options: Options<ListObservationScopesData, ThrowOnError>
+) =>
+  (options.client ?? client).get<
+    ListObservationScopesResponses,
+    ListObservationScopesErrors,
+    ThrowOnError
+  >({ url: "/v1/default/banks/{bank_id}/observations/scopes", ...options });
 
 /**
  * Recover failed consolidation
@@ -1164,7 +1260,7 @@ export const listWebhookDeliveries = <ThrowOnError extends boolean = false>(
 /**
  * Clear memory bank memories
  *
- * Delete memory units for a memory bank. Optionally filter by type (world, experience, opinion) to delete only specific types. This is a destructive operation that cannot be undone. The bank profile (disposition and background) will be preserved.
+ * Delete memory units for a memory bank. Optionally filter by type (world, experience, observation) to delete only specific types. This is a destructive operation that cannot be undone. The bank profile (disposition and background) will be preserved.
  */
 export const clearBankMemories = <ThrowOnError extends boolean = false>(
   options: Options<ClearBankMemoriesData, ThrowOnError>
@@ -1284,5 +1380,31 @@ export const auditLogStats = <ThrowOnError extends boolean = false>(
 ) =>
   (options.client ?? client).get<AuditLogStatsResponses, AuditLogStatsErrors, ThrowOnError>({
     url: "/v1/default/banks/{bank_id}/audit-logs/stats",
+    ...options,
+  });
+
+/**
+ * List LLM request traces
+ *
+ * List traced LLM requests for a bank, ordered by most recent first. Requires LLM request tracing to be enabled (HINDSIGHT_API_LLM_TRACE_ENABLED).
+ */
+export const listLlmRequests = <ThrowOnError extends boolean = false>(
+  options: Options<ListLlmRequestsData, ThrowOnError>
+) =>
+  (options.client ?? client).get<ListLlmRequestsResponses, ListLlmRequestsErrors, ThrowOnError>({
+    url: "/v1/default/banks/{bank_id}/llm-requests",
+    ...options,
+  });
+
+/**
+ * LLM request statistics
+ *
+ * Get LLM request counts grouped by time bucket and status for charting.
+ */
+export const llmRequestStats = <ThrowOnError extends boolean = false>(
+  options: Options<LlmRequestStatsData, ThrowOnError>
+) =>
+  (options.client ?? client).get<LlmRequestStatsResponses, LlmRequestStatsErrors, ThrowOnError>({
+    url: "/v1/default/banks/{bank_id}/llm-requests/stats",
     ...options,
   });

@@ -172,7 +172,11 @@ function getMcpToolGroups(t: (key: string) => string): McpToolGroup[] {
       label: t("mcpGroupDirectives"),
       tools: ["list_directives", "create_directive", "delete_directive"],
     },
-    { key: "memories", label: t("mcpGroupMemories"), tools: ["list_memories", "get_memory"] },
+    {
+      key: "memories",
+      label: t("mcpGroupMemories"),
+      tools: ["list_memories", "get_memory", "update_memory", "invalidate_memory"],
+    },
     {
       key: "documents",
       label: t("mcpGroupDocuments"),
@@ -211,6 +215,8 @@ const MCP_ALL_TOOLS: string[] = [
   "delete_directive",
   "list_memories",
   "get_memory",
+  "update_memory",
+  "invalidate_memory",
   "list_documents",
   "get_document",
   "delete_document",
@@ -1419,7 +1425,6 @@ function MapFieldsEditor({
   };
 
   const isRoot = depth === 0;
-  const indent = `${(depth + 1) * 12}px`;
 
   return (
     <div

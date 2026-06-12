@@ -15,16 +15,164 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
+from ...extensions.memory_defense import (
+    DefenseAction,
+    DefenseDecision,
+    MemoryDefenseExtension,
+    apply_redaction,
+    parse_policy,
+)
 from ...worker.stage import set_stage
-from ..db.base import DatabaseBackend
 from ..db_utils import acquire_with_retry
 from ..memory_engine import count_tokens, fq_table
 from . import bank_utils
 
 
+@dataclass
+class BlockedViolation:
+    """One item blocked by the Memory Defense policy (surfaced in the 422 body)."""
+
+    index: int
+    detector: str | None
+    message: str
+
+
+class MemoryDefenseAllBlockedError(Exception):
+    """Raised when every item in a retain batch is blocked by the Memory Defense policy."""
+
+    def __init__(self, violations: list[BlockedViolation]) -> None:
+        self.violations = violations
+        super().__init__(f"all {len(violations)} items blocked by Memory Defense policy")
+
+
 def utcnow():
     """Get current UTC time."""
     return datetime.now(UTC)
+
+
+def _redact_document_body(body: str, config: Any) -> str:
+    """Apply Memory Defense redaction to a document body.
+
+    Per-item screening only scrubs the chunked content that goes through
+    `screen()`. When a sub-batch carries `document_body_override` (the full
+    original text of an oversized item — see `_split_contents_into_sub_batches`),
+    that override bypasses screening and would persist verbatim into
+    `documents.original_text`. Apply the same redactor here so the document
+    body is scrubbed regardless of which path produced it.
+    """
+    try:
+        policy = parse_policy(getattr(config, "memory_defense", None))
+    except Exception:
+        return body
+    if not policy.enabled:
+        return body
+    if not any(r.on == "sensitive_data" for r in policy.rules):
+        return body
+    return apply_redaction(body).content
+
+
+async def _fire_memory_defense_webhook(
+    webhook_manager: Any,
+    *,
+    conn: Any,
+    schema: str | None,
+    bank_id: str,
+    operation_id: str | None,
+    document_id: str | None,
+    decision: DefenseDecision,
+) -> None:
+    """Fire a memory_defense.triggered webhook for a non-allow decision.
+
+    No-op when no webhook manager is wired or none is subscribed. Delivery
+    failures are swallowed so screening never blocks a retain.
+    """
+    if webhook_manager is None:
+        return
+    try:
+        from ...webhooks import (
+            MemoryDefenseEventData,
+            MemoryDefenseHit,
+            WebhookEvent,
+            WebhookEventType,
+        )
+
+        # Translate per-match raw dicts on the decision into MemoryDefenseHit
+        # entries on the wire. The decision's hits list is already fingerprinted
+        # by apply_redaction (the raw value never lands in hits, by contract),
+        # so this is purely a shape conversion. None when no per-hit data is
+        # available so receivers can distinguish "no preview info" from
+        # "scanned, nothing matched" (the latter wouldn't be a webhook delivery
+        # in the first place).
+        decision_hits = getattr(decision, "hits", None) or []
+        hits: list[MemoryDefenseHit] | None = [
+            MemoryDefenseHit(
+                detector=str(h.get("detector") or ""),
+                preview=str(h.get("preview") or ""),
+            )
+            for h in decision_hits
+            if h.get("detector") and h.get("preview")
+        ] or None
+
+        event = WebhookEvent(
+            event=WebhookEventType.MEMORY_DEFENSE_TRIGGERED,
+            bank_id=bank_id,
+            operation_id=operation_id or "",
+            status=decision.action.value,
+            timestamp=utcnow(),
+            data=MemoryDefenseEventData(
+                action=decision.action.value,
+                detector=decision.detector,
+                document_id=document_id,
+                matched_types=decision.matched_types or None,
+                message=decision.message or None,
+                hits=hits,
+                # Optional SIEM-enrichment fields populated by downstream
+                # extensions (e.g. hindsight-cloud's _CloudDefenseDecision
+                # subclass). Read via getattr so OSS doesn't need to know
+                # about extension subclasses. Combined with the manager's
+                # exclude_none serialization, missing values stay absent
+                # from the wire entirely rather than appearing as null.
+                severity=getattr(decision, "severity", None),
+                api_key_name=getattr(decision, "api_key_name", None),
+                memory_unit_id=getattr(decision, "memory_unit_id", None),
+                receipt_uri=getattr(decision, "receipt_uri", None),
+            ),
+        )
+        await webhook_manager.fire_event_with_conn(event, conn, schema=schema)
+    except Exception:
+        logger.warning("memory_defense webhook delivery failed", exc_info=True)
+
+
+def _audit_memory_defense(
+    audit_logger: Any,
+    *,
+    bank_id: str,
+    document_id: str | None,
+    decision: DefenseDecision,
+) -> None:
+    """Write a fire-and-forget ``memory_defense`` audit entry for a non-allow decision.
+
+    No-op when audit logging is disabled (the logger gates on its own config).
+    The action taken (redact/block) and what matched live in the entry metadata.
+    """
+    if audit_logger is None:
+        return
+    from ..audit import AuditEntry
+
+    entry = AuditEntry(
+        action="memory_defense",
+        transport="system",
+        bank_id=bank_id,
+        metadata={
+            "action": decision.action.value,
+            "detector": decision.detector,
+            "document_id": document_id,
+            "matched_types": decision.matched_types,
+            "message": decision.message,
+        },
+    )
+    entry.ended_at = entry.started_at  # point-in-time policy decision (duration 0)
+    audit_logger.log_fire_and_forget(entry)
 
 
 def _merge_processed_content_tokens(a: int | None, b: int | None) -> int | None:
@@ -112,6 +260,25 @@ RetainOutboxCallback = Callable[[asyncpg.Connection], Awaitable[None]]
 RetainOutboxCallbackFactory = Callable[[list[RetainContentDict]], RetainOutboxCallback | None]
 
 
+def _resolve_narrator(profile_name: str, bank_id: str) -> str | None:
+    """Resolve the narrator (memory owner) used to prime fact extraction.
+
+    The narrator is injected as a "Narrator: {name}" line in fact extraction and
+    is stamped into the who-dimension of every first-person fact — and the
+    observations later consolidated from those facts. That is correct for a named
+    agent retaining its own logs, but harmful when ``name`` is just the bank_id:
+    on auto-create the bank ``name`` defaults to ``bank_id``, which is typically a
+    routing key (e.g. ``my-agent::channel-456::user-789``), not a speaker. Priming
+    extraction with a routing key embeds that string into stored fact text and
+    pollutes downstream observations (issue #1680). Suppress it in that case.
+
+    Returns the narrator name, or ``None`` to omit the Narrator line entirely.
+    """
+    if profile_name == bank_id:
+        return None
+    return profile_name
+
+
 def _build_retain_params(contents_dicts, document_tags=None, doc_contents=None):
     """Build retain_params and merged_tags from content dicts."""
     if doc_contents is not None:
@@ -139,6 +306,8 @@ def _build_retain_params(contents_dicts, document_tags=None, doc_contents=None):
             )
         if first_item.get("metadata"):
             retain_params["metadata"] = first_item["metadata"]
+        if first_item.get("observation_scopes") is not None:
+            retain_params["observation_scopes"] = first_item["observation_scopes"]
 
     return retain_params, merged_tags
 
@@ -405,6 +574,10 @@ async def retain_batch(
     db_semaphore: "asyncio.Semaphore | None" = None,
     document_body_override: str | None = None,
     chunk_index_offset: int = 0,
+    progress_callback: "Callable[..., Awaitable[None]] | None" = None,
+    webhook_manager: Any = None,
+    memory_defense_extension: "MemoryDefenseExtension | None" = None,
+    audit_logger: Any = None,
 ) -> tuple[list[list[str]], TokenUsage, int | None]:
     """
     Process a batch of content through the retain pipeline.
@@ -440,7 +613,9 @@ async def retain_batch(
 
     # Get bank profile
     profile = await bank_utils.get_bank_profile(pool, bank_id)
-    agent_name = profile["name"]
+    # Suppress the narrator when name == bank_id (auto-create default) — see
+    # _resolve_narrator for why a routing-key narrator pollutes extraction (#1680).
+    agent_name = _resolve_narrator(profile["name"], bank_id)
 
     # Convert dicts to RetainContent objects
     contents = _build_contents(contents_dicts, document_tags)
@@ -493,6 +668,10 @@ async def retain_batch(
                     db_semaphore=db_semaphore,
                     document_body_override=document_body_override,
                     chunk_index_offset=chunk_index_offset,
+                    progress_callback=progress_callback,
+                    webhook_manager=webhook_manager,
+                    memory_defense_extension=memory_defense_extension,
+                    audit_logger=audit_logger,
                 )
                 for group_idx, orig_idx in enumerate(original_indices[doc_key]):
                     if group_idx < len(group_ids):
@@ -500,6 +679,80 @@ async def retain_batch(
                 total_usage = total_usage + group_usage
                 total_processed_tokens = _merge_processed_content_tokens(total_processed_tokens, group_processed)
             return result_unit_ids, total_usage, total_processed_tokens
+
+    # --- Memory Defense pre-extraction screening ---
+    # Delegate to the loaded extension. `config` is a resolved HindsightConfig
+    # object at this point (see _retain_batch_async_internal). On a non-allow
+    # decision we redact in place or drop the item, and fire a
+    # memory_defense.triggered webhook when one is configured.
+    _policy = parse_policy(getattr(config, "memory_defense", None))
+    _blocked_violations: list[BlockedViolation] = []
+
+    if memory_defense_extension is not None and _policy.enabled:
+        async with acquire_with_retry(pool) as _defense_conn:
+            for _idx, _content in enumerate(contents):
+                # Prefer the per-item document_id over the batch-level value so
+                # the decision and webhook carry the document the caller
+                # submitted, not whichever doc_id the batch happens to share.
+                _item_doc_id = contents_dicts[_idx].get("document_id") or document_id
+
+                _decision = await memory_defense_extension.screen(
+                    policy=_policy,
+                    bank_id=bank_id,
+                    document_id=_item_doc_id,
+                    content=_content.content,
+                    tags=_content.tags,
+                )
+
+                if _decision.action is DefenseAction.ALLOW:
+                    continue
+
+                if _decision.action is DefenseAction.REDACT:
+                    _redacted = _decision.redacted_content or _content.content
+                    _content.content = _redacted
+                    # Mirror the redaction into the raw dict so the document
+                    # body persisted further down the pipeline also stores the
+                    # redacted text, not the verbatim secret.
+                    contents_dicts[_idx]["content"] = _redacted
+                elif _decision.action is DefenseAction.BLOCK:
+                    _blocked_violations.append(
+                        BlockedViolation(
+                            index=_idx,
+                            detector=_decision.detector,
+                            message=_decision.message,
+                        )
+                    )
+
+                await _fire_memory_defense_webhook(
+                    webhook_manager,
+                    conn=_defense_conn,
+                    schema=schema,
+                    bank_id=bank_id,
+                    operation_id=operation_id,
+                    document_id=_item_doc_id,
+                    decision=_decision,
+                )
+                _audit_memory_defense(
+                    audit_logger,
+                    bank_id=bank_id,
+                    document_id=_item_doc_id,
+                    decision=_decision,
+                )
+
+    if _blocked_violations:
+        # All items blocked → raise so the HTTP layer can return 422.
+        if len(_blocked_violations) == len(contents):
+            raise MemoryDefenseAllBlockedError(_blocked_violations)
+
+        # Remove blocked items from the pipeline.
+        _skip_indices = {v.index for v in _blocked_violations}
+        if _skip_indices:
+            _surviving = [i for i in range(len(contents)) if i not in _skip_indices]
+            contents = [contents[i] for i in _surviving]
+            contents_dicts = [contents_dicts[i] for i in _surviving]
+            # If nothing survives, return empty results immediately.
+            if not contents:
+                return [[] for _ in contents_dicts], TokenUsage(), 0
 
     # Resolve effective document_id early so both delta and streaming paths
     # can find existing chunks from a prior attempt. On retry, a generated
@@ -693,6 +946,7 @@ async def retain_batch(
         db_semaphore=db_semaphore,
         document_body_override=document_body_override,
         chunk_index_offset=chunk_index_offset,
+        progress_callback=progress_callback,
     )
 
 
@@ -832,6 +1086,7 @@ async def _streaming_retain_batch(
     db_semaphore: "asyncio.Semaphore | None" = None,
     document_body_override: str | None = None,
     chunk_index_offset: int = 0,
+    progress_callback: "Callable[..., Awaitable[None]] | None" = None,
 ) -> tuple[list[list[str]], TokenUsage]:
     """
     Process a large document in streaming mini-batches to bound memory usage.
@@ -871,7 +1126,9 @@ async def _streaming_retain_batch(
     # so documents.original_text stores the complete payload, not just this
     # slice (issue #1838).
     if document_body_override is not None:
-        combined_content = document_body_override
+        # The override is the unmodified original body — apply redaction so
+        # secrets in oversized inputs don't bypass screening.
+        combined_content = _redact_document_body(document_body_override, config)
     else:
         combined_content = "\n".join([c.get("content", "") for c in contents_dicts])
     # Memory: contents_dicts content strings are now captured in combined_content.
@@ -953,19 +1210,29 @@ async def _streaming_retain_batch(
                 tags=source.tags,
                 observation_scopes=source.observation_scopes,
             )
-            extracted, processed, chunk_meta, usage = await _extract_and_embed(
-                [content],
-                llm_config,
-                agent_name,
-                config,
-                embeddings_model,
-                format_date_fn,
-                fact_type_override,
-                log_buffer,
-                pool,
-                operation_id,
-                schema,
-            )
+            # Attribute this chunk's extraction LLM call to its document, so the
+            # trace row carries document_id (a document accrues one such trace
+            # per retain/re-retain). Per-call: the operation-level trace context
+            # is shared across a batch's documents.
+            from ..llm_trace import reset_call_metadata, set_call_metadata
+
+            meta_token = set_call_metadata({"document_id": effective_doc_id})
+            try:
+                extracted, processed, chunk_meta, usage = await _extract_and_embed(
+                    [content],
+                    llm_config,
+                    agent_name,
+                    config,
+                    embeddings_model,
+                    format_date_fn,
+                    fact_type_override,
+                    log_buffer,
+                    pool,
+                    operation_id,
+                    schema,
+                )
+            finally:
+                reset_call_metadata(meta_token)
             await chunk_queue.put((global_idx, content, extracted, processed, chunk_meta, usage))
             # Memory: release the chunk text from the shared list now that it's
             # been extracted and queued. The queued RetainContent holds its own copy.
@@ -1000,6 +1267,25 @@ async def _streaming_retain_batch(
     async def _db_consumer() -> None:
         batch: list[tuple] = []
         consumer_batch_idx = 0
+        chunks_committed = 0
+
+        # Best-effort durable progress: how many chunks of this document have been
+        # extracted+committed so far. Written per consumer batch so an operator polling
+        # the retain operation sees "storing 200/1200 chunks" advancing instead of a
+        # single opaque sub-batch tick. Never lets a heartbeat failure break retain.
+        async def _emit_chunk_progress() -> None:
+            if not (progress_callback and operation_id):
+                return
+            try:
+                await progress_callback(
+                    operation_id,
+                    stage="storing",
+                    processed=chunks_committed,
+                    total=total_chunks,
+                    detail={"facts_committed": len(all_unit_ids)},
+                )
+            except Exception:
+                logger.debug("retain chunk-progress write failed", exc_info=True)
 
         while True:
             item = await chunk_queue.get()
@@ -1011,6 +1297,8 @@ async def _streaming_retain_batch(
                         consumer_batch_idx,
                         is_last=True,
                     )
+                    chunks_committed += len(batch)
+                    await _emit_chunk_progress()
                 break
 
             batch.append(item)
@@ -1030,6 +1318,8 @@ async def _streaming_retain_batch(
                     is_last=False,
                 )
                 consumer_batch_idx += 1
+                chunks_committed += len(batch)
+                await _emit_chunk_progress()
                 batch = []
 
     async def _process_db_batch(
@@ -1182,30 +1472,17 @@ async def _streaming_retain_batch(
             async with acquire_with_retry(pool) as conn:
                 async with conn.transaction():
                     # --- Document ownership gate ---
-                    # Lock the document row to serialize all concurrent writers.
-                    #
-                    # We do this with a SINGLE upsert that both creates the row (if
-                    # absent) and locks it (if present) atomically. The earlier
-                    # two-step form — INSERT ... ON CONFLICT DO NOTHING followed by a
-                    # separate SELECT ... FOR UPDATE — could deadlock under concurrent
-                    # same-document retains: DO NOTHING takes no row lock on an
-                    # existing row, so writers interleaved the speculative-insert
-                    # ShareLock with the later FOR UPDATE and cascade-DELETE in
-                    # inconsistent orders, producing 3-way lock cycles in
-                    # handle_document_tracking. ON CONFLICT DO UPDATE always takes the
-                    # row lock as part of the same statement, so all writers serialize
-                    # on the document row in a single, consistent step.
-                    #
-                    # The SET is a no-op self-assignment (content_hash unchanged) used
-                    # only to acquire the lock; the real hash is written immediately
-                    # below by handle_document_tracking / upsert_document_metadata.
-                    # ``RETURNING`` yields the pre-existing hash (or '__pending__' for a
-                    # freshly inserted row).
-                    existing_hash = await conn.fetchval(
-                        f"INSERT INTO {fq_table('documents')} (id, bank_id, original_text, content_hash) "
-                        f"VALUES ($1, $2, '', '__pending__') "
-                        f"ON CONFLICT (id, bank_id) DO UPDATE SET content_hash = {fq_table('documents')}.content_hash "
-                        f"RETURNING content_hash",
+                    # Ensure the document row exists, lock it to serialize all
+                    # concurrent same-document writers, and read its pre-existing
+                    # hash. The lock prevents interleaved retains from corrupting
+                    # each other in handle_document_tracking; the returned hash
+                    # ('__pending__' for a freshly inserted row) drives the
+                    # takeover check for later batches below. The PG/Oracle split
+                    # lives in the ops layer because Oracle can't do this upsert +
+                    # RETURNING in a single statement.
+                    existing_hash = await pool.ops.lock_document_for_write(
+                        conn,
+                        fq_table("documents"),
                         effective_doc_id,
                         bank_id,
                     )
@@ -1642,6 +1919,7 @@ async def _try_delta_retain(
             start_time,
             outbox_callback,
             document_body_override=document_body_override,
+            config=config,
         )
 
     # Build content items for only the changed/new chunks
@@ -1659,6 +1937,7 @@ async def _try_delta_retain(
             start_time,
             outbox_callback,
             document_body_override=document_body_override,
+            config=config,
         )
 
     # Freshness recheck BEFORE the (expensive) LLM extraction.
@@ -1710,6 +1989,7 @@ async def _try_delta_retain(
                 start_time,
                 outbox_callback,
                 document_body_override=document_body_override,
+                config=config,
             )
         log_buffer.append(
             f"[delta] Recheck: {len(recheck.changed) + len(recheck.new) + len(recheck.removed)} chunks still differ — "
@@ -1718,20 +1998,28 @@ async def _try_delta_retain(
         logger.info("\n" + "\n".join(log_buffer) + "\n")
         return None
 
-    # Extract facts and generate embeddings (shared pipeline)
-    extracted_facts, processed_facts, new_chunk_metadata, usage = await _extract_and_embed(
-        delta_contents,
-        llm_config,
-        agent_name,
-        config,
-        embeddings_model,
-        format_date_fn,
-        fact_type_override,
-        log_buffer,
-        pool,
-        operation_id,
-        schema,
-    )
+    # Extract facts and generate embeddings (shared pipeline). Attribute these
+    # extraction calls to the document so the delta re-retain's trace also binds
+    # to it (a document accrues one trace per full/delta retain).
+    from ..llm_trace import reset_call_metadata, set_call_metadata
+
+    meta_token = set_call_metadata({"document_id": effective_doc_id})
+    try:
+        extracted_facts, processed_facts, new_chunk_metadata, usage = await _extract_and_embed(
+            delta_contents,
+            llm_config,
+            agent_name,
+            config,
+            embeddings_model,
+            format_date_fn,
+            fact_type_override,
+            log_buffer,
+            pool,
+            operation_id,
+            schema,
+        )
+    finally:
+        reset_call_metadata(meta_token)
 
     # Database transaction
     result_unit_ids: list[list[str]] = []
@@ -1777,9 +2065,10 @@ async def _try_delta_retain(
                 step_start = time.time()
                 # When this sub-batch is one slice of an oversized item
                 # split across multiple sub-batches, store the full body
-                # (issue #1838) instead of just the slice.
+                # (issue #1838) instead of just the slice. Redact the
+                # override since it bypassed per-chunk screening.
                 if document_body_override is not None:
-                    combined_content = document_body_override
+                    combined_content = _redact_document_body(document_body_override, config)
                 else:
                     combined_content = "\n".join([c.get("content", "") for c in contents_dicts])
                 retain_params, merged_tags = _build_retain_params(contents_dicts, document_tags)
@@ -1908,6 +2197,7 @@ async def _delta_metadata_only(
     outbox_callback,
     *,
     document_body_override: str | None = None,
+    config: Any = None,
 ):
     """Handle the case where no chunks changed — just update document metadata and tags."""
     async with acquire_with_retry(pool) as conn:
@@ -1920,8 +2210,9 @@ async def _delta_metadata_only(
             )
             # When this sub-batch is a slice of an oversized item, write the
             # full original body (issue #1838) instead of just the slice.
+            # Redact the override since it bypassed per-chunk screening.
             if document_body_override is not None:
-                combined_content = document_body_override
+                combined_content = _redact_document_body(document_body_override, config)
             else:
                 combined_content = "\n".join([c.get("content", "") for c in contents_dicts])
             retain_params, merged_tags = _build_retain_params(contents_dicts, document_tags)

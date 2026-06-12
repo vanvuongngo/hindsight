@@ -382,9 +382,24 @@ export class HindsightClient {
       excludeMentalModels?: boolean;
       /** Exclude specific mental models by ID from reflection. */
       excludeMentalModelIds?: string[];
+      /** If true, the response includes a 'based_on' field listing the memories, mental models, and directives used. */
+      includeFacts?: boolean;
+      /** If true, the response includes a 'trace' field with the tool calls and LLM calls made during reflection (trace.tool_calls / trace.llm_calls). */
+      includeToolCalls?: boolean;
+      /** When includeToolCalls is true, set to false for an inputs-only trace (smaller payload). Ignored otherwise. Default: true. */
+      includeToolCallOutput?: boolean;
       signal?: AbortSignal;
     }
   ): Promise<ReflectResponse> {
+    const include =
+      options?.includeFacts || options?.includeToolCalls
+        ? {
+            facts: options?.includeFacts ? {} : undefined,
+            tool_calls: options?.includeToolCalls
+              ? { output: options?.includeToolCallOutput ?? true }
+              : undefined,
+          }
+        : undefined;
     const response = await sdk.reflect({
       client: this.client,
       path: { bank_id: bankId },
@@ -399,6 +414,7 @@ export class HindsightClient {
         fact_types: options?.factTypes,
         exclude_mental_models: options?.excludeMentalModels,
         exclude_mental_model_ids: options?.excludeMentalModelIds,
+        include,
       },
       signal: options?.signal,
     });
@@ -417,6 +433,8 @@ export class HindsightClient {
       type?: string;
       q?: string;
       consolidationState?: "failed" | "pending" | "done";
+      state?: "valid" | "invalidated";
+      documentId?: string;
       signal?: AbortSignal;
     }
   ): Promise<ListMemoryUnitsResponse> {
@@ -429,6 +447,8 @@ export class HindsightClient {
         type: options?.type,
         q: options?.q,
         consolidation_state: options?.consolidationState,
+        state: options?.state,
+        document_id: options?.documentId,
       },
       signal: options?.signal,
     });
