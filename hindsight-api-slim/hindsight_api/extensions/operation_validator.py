@@ -97,6 +97,10 @@ class PrecheckContext:
     - ``bank_id``: parsed from the URL path.
     - ``request_context``: the authenticated :class:`RequestContext` (tenant
       already resolved by the tenant extension).
+    - ``content_length``: value of the ``Content-Length`` request header as an
+      int, or ``None`` when the header is absent or unparseable (e.g. chunked
+      transfer encoding). Lets a precheck make size-aware decisions — such as
+      an upper-bound cost estimate — without reading or deserialising the body.
 
     Implementations should keep precheck cheap and side-effect-free. The
     full per-request validators (``validate_retain`` / ``validate_recall``
@@ -107,6 +111,7 @@ class PrecheckContext:
     operation: str
     bank_id: str
     request_context: "RequestContext"
+    content_length: int | None = None
 
 
 @dataclass
@@ -203,6 +208,16 @@ class RetainResult:
     llm_input_tokens: int | None = None
     llm_output_tokens: int | None = None
     llm_total_tokens: int | None = None
+    # Diagnostic token splits surfaced for cost attribution and prompt-cache
+    # tuning. ``llm_cached_input_tokens`` is the subset of llm_input_tokens
+    # served from the provider's prompt cache (e.g. Gemini's
+    # cached_content_token_count). ``llm_thoughts_tokens`` is reasoning tokens
+    # that are billed at the output rate by some providers (Gemini 2.5+) but
+    # are not part of the visible response. Both default to None when the
+    # engine/provider didn't report them; downstream metering extensions
+    # should treat None as 0.
+    llm_cached_input_tokens: int | None = None
+    llm_thoughts_tokens: int | None = None
     # Content tokens the retain pipeline actually processed, after
     # chunk-level content-hash deduplication. Semantics:
     #   None — no dedup signal available (e.g. a first-time retain or a

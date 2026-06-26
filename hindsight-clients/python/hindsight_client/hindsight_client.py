@@ -46,6 +46,7 @@ from hindsight_client_api.models.list_memory_units_response import ListMemoryUni
 from hindsight_client_api.models.recall_response import RecallResponse
 from hindsight_client_api.models.reflect_response import ReflectResponse
 from hindsight_client_api.models.retain_response import RetainResponse
+from hindsight_client_api.models.version_response import VersionResponse
 
 
 def _run_async(coro):
@@ -245,6 +246,29 @@ class Hindsight:
         if self._api_client:
             await self._api_client.close()
 
+    def get_version(self) -> VersionResponse:
+        """
+        Read the connected Hindsight API version and feature flags
+        (sync wrapper — prefer :meth:`aget_version` in async code).
+
+        Useful for integrations that need to enforce a minimum server version
+        before enabling a workflow.
+
+        Returns:
+            VersionResponse with ``api_version`` and ``features``.
+        """
+        return _run_async(self._monitoring_api.get_version(_request_timeout=self._timeout))
+
+    async def aget_version(self) -> VersionResponse:
+        """
+        Read the connected Hindsight API version and feature flags
+        (async — preferred over :meth:`get_version`).
+
+        Returns:
+            VersionResponse with ``api_version`` and ``features``.
+        """
+        return await self._monitoring_api.get_version(_request_timeout=self._timeout)
+
     # Simplified methods for main operations
 
     def retain(
@@ -385,6 +409,7 @@ class Hindsight:
         tags: list[str] | None = None,
         tags_match: Literal["any", "all", "any_strict", "all_strict", "exact"] = "any",
         tag_groups: list[dict[str, Any]] | None = None,
+        prefer_observations: bool = False,
     ) -> RecallResponse:
         """
         Recall memories using semantic similarity (sync wrapper — prefer :meth:`arecall` in async code).
@@ -392,7 +417,7 @@ class Hindsight:
         Args:
             bank_id: The memory bank ID
             query: Search query
-            types: Optional list of fact types to filter (world, experience, opinion, observation)
+            types: Optional list of fact types to filter (world, experience, observation)
             max_tokens: Maximum tokens in results (default: 4096)
             budget: Budget level for recall - "low", "mid", or "high" (default: "mid")
             trace: Enable trace output (default: False)
@@ -409,6 +434,10 @@ class Hindsight:
                 "any_strict" (OR, excludes untagged), "all_strict" (AND, excludes untagged),
                 "exact" (set equality, excludes untagged). Default: "any"
             tag_groups: Optional list of tag group filters for advanced boolean tag matching.
+            prefer_observations: When recalling raw facts ("world"/"experience") together with
+                "observation", drop any raw fact a returned observation was consolidated from, so the
+                observation supersedes it (no duplicate content). Disabled by default; no effect unless
+                "observation" and at least one raw type are both in ``types``.
 
         Returns:
             RecallResponse with results, optional entities, optional chunks, optional source_facts, and optional trace
@@ -431,6 +460,7 @@ class Hindsight:
                 tags=tags,
                 tags_match=tags_match,
                 tag_groups=tag_groups,
+                prefer_observations=prefer_observations,
             )
         )
 
@@ -859,6 +889,7 @@ class Hindsight:
         tags: list[str] | None = None,
         tags_match: Literal["any", "all", "any_strict", "all_strict", "exact"] = "any",
         tag_groups: list[dict[str, Any]] | None = None,
+        prefer_observations: bool = False,
     ) -> RecallResponse:
         """
         Recall memories using semantic similarity (async — preferred over :meth:`recall`).
@@ -866,7 +897,7 @@ class Hindsight:
         Args:
             bank_id: The memory bank ID
             query: Search query
-            types: Optional list of fact types to filter (world, experience, opinion, observation)
+            types: Optional list of fact types to filter (world, experience, observation)
             max_tokens: Maximum tokens in results (default: 4096)
             budget: Budget level for recall - "low", "mid", or "high" (default: "mid")
             trace: Enable trace output (default: False)
@@ -887,6 +918,11 @@ class Hindsight:
                 TagGroupOr, or TagGroupNot). Example::
 
                     [{"tags": ["customer"], "match": "all"}, {"not": {"tags": ["internal"]}}]
+
+            prefer_observations: When recalling raw facts ("world"/"experience") together with
+                "observation", drop any raw fact a returned observation was consolidated from, so the
+                observation supersedes it (no duplicate content). Disabled by default; no effect unless
+                "observation" and at least one raw type are both in ``types``.
 
         Returns:
             RecallResponse with results, optional entities, optional chunks, optional source_facts, and optional trace
@@ -917,6 +953,7 @@ class Hindsight:
         request_obj = recall_request.RecallRequest(
             query=query,
             types=types,
+            prefer_observations=prefer_observations,
             budget=budget,
             max_tokens=max_tokens,
             trace=trace,

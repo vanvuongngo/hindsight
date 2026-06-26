@@ -14,6 +14,7 @@ from typing import Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, create_model, field_validator
 
+from ..llm_interface import ProviderRateLimitResetError
 from ..llm_wrapper import LLMConfig, OutputTooLongError, sanitize_llm_output
 from ..operation_metadata import RetainExtractionErrors
 from ..response_models import TokenUsage
@@ -451,6 +452,11 @@ def chunk_text(text: str, max_chars: int, structured_chunk_size: int | None = No
     ``structured_chunk_size``. When unset, that limit defaults to ``max_chars``.
     For plain text, uses sentence-aware splitting.
 
+    The result is idempotent: re-chunking any chunk this returns yields that chunk
+    unchanged. The streaming retain pipeline pre-chunks each document once and then
+    re-chunks every piece during extraction; if a piece re-split, its sub-chunks
+    would inherit one chunk_index and collide on ``chunk_id`` (issue #2301).
+
     Args:
         text: Input text to chunk (plain text, JSON conversation, or JSONL)
         max_chars: Target maximum characters per chunk
@@ -469,11 +475,23 @@ def chunk_text(text: str, max_chars: int, structured_chunk_size: int | None = No
     # Try to parse as JSON conversation array
     try:
         parsed = json.loads(text)
-        if isinstance(parsed, list) and all(isinstance(turn, dict) for turn in parsed):
-            # This looks like a conversation - chunk at turn boundaries
-            return _chunk_conversation(parsed, max_chars, structured_limit)
     except (json.JSONDecodeError, ValueError):
-        pass
+        parsed = None
+
+    if isinstance(parsed, list) and all(isinstance(turn, dict) for turn in parsed):
+        # This looks like a conversation - chunk at turn boundaries
+        return _chunk_conversation(parsed, max_chars, structured_limit)
+
+    if isinstance(parsed, dict):
+        # A single JSON object — e.g. one JSONL line handed back to the extractor
+        # after the producer already pre-chunked it. It is one structured unit:
+        # keep it whole up to the structured limit, else split it as text within
+        # the chunk budget. Without this, a lone object (one line, so _chunk_jsonl
+        # declines) would fall through to plain-text splitting and re-split a chunk
+        # the producer deliberately kept whole — breaking idempotency (issue #2301).
+        if len(text) <= structured_limit:
+            return [text]
+        return _split_oversized_unit(text, max_chars)
 
     # Try to parse as JSONL (newline-delimited JSON objects, e.g. session logs)
     jsonl_chunks = _chunk_jsonl(text, max_chars, structured_limit)
@@ -515,10 +533,12 @@ def _chunk_conversation(turns: list[dict], max_chars: int, structured_limit: int
         turn_size = turn_unit_size + 1  # +1 for comma
 
         # A turn too large to keep whole even alone: flush, then split it as
-        # text so no chunk runs far over budget (the extractor won't re-chunk).
+        # text. Fragment within min(structured_limit, max_chars) so no fragment
+        # exceeds the chunk budget — otherwise a downstream re-chunk would split
+        # it again and collide on chunk_id (issue #2301).
         if turn_unit_size > structured_limit:
             _flush()
-            chunks.extend(_split_oversized_unit(turn_json, structured_limit))
+            chunks.extend(_split_oversized_unit(turn_json, min(structured_limit, max_chars)))
             continue
 
         # If adding this turn would exceed limit and we have turns, save current chunk
@@ -581,10 +601,12 @@ def _chunk_jsonl(text: str, max_chars: int, structured_limit: int) -> list[str] 
         line_size = len(line) + 1  # +1 for the joining newline
 
         # A line too large to keep whole even alone: flush, then split it as
-        # text so no chunk runs far over budget (the extractor won't re-chunk).
+        # text. Fragment within min(structured_limit, max_chars) so no fragment
+        # exceeds the chunk budget — otherwise a downstream re-chunk would split
+        # it again and collide on chunk_id (issue #2301).
         if line_unit_size > structured_limit:
             _flush()
-            chunks.extend(_split_oversized_unit(line, structured_limit))
+            chunks.extend(_split_oversized_unit(line, min(structured_limit, max_chars)))
             continue
 
         # If adding this line would exceed the limit and we have lines, flush.
@@ -1792,10 +1814,21 @@ async def extract_facts_from_text(
         total_usage = total_usage + chunk_usage
 
     if failed_chunks:
+        failed_summary = ", ".join(f"chunk {idx}: {type(err).__name__}" for idx, err in failed_chunks[:5])
+        quota_errors = [err for _, err in failed_chunks if isinstance(err, ProviderRateLimitResetError)]
+        if quota_errors and len(quota_errors) == len(failed_chunks):
+            retry_at = max(err.retry_at for err in quota_errors)
+            raise ProviderRateLimitResetError(
+                retry_at=retry_at,
+                message=(
+                    f"Fact extraction deferred by provider quota: {len(failed_chunks)}/{len(chunks)} chunks failed. "
+                    f"First failures: {failed_summary}. Provider detail: {quota_errors[0]}"
+                ),
+            ) from quota_errors[0]
+
         # Fail the entire retain — partial extraction is not acceptable.
         # All successfully extracted facts are discarded because the transaction
         # hasn't committed yet. The worker poller will retry the entire task.
-        failed_summary = ", ".join(f"chunk {idx}: {type(err).__name__}" for idx, err in failed_chunks[:5])
         raise RuntimeError(
             f"Fact extraction failed: {len(failed_chunks)}/{len(chunks)} chunks failed. "
             f"First failures: {failed_summary}"

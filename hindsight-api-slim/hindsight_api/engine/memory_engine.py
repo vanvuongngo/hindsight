@@ -35,6 +35,8 @@ from ..config import (
     DEFAULT_REFLECT_SOURCE_FACTS_MAX_TOKENS,
     ENV_MODEL_INIT_TIMEOUT,
     HindsightConfig,
+    LLMMemberConfig,
+    LLMStrategyConfig,
     get_config,
 )
 from ..tracing import create_operation_span
@@ -45,6 +47,7 @@ from .audit import AuditLogger, audit_context
 from .bank_stats_cache import BankStatsCache
 from .db import DatabaseBackend, create_database_backend
 from .db_budget import budgeted_operation
+from .llm_interface import ProviderRateLimitResetError
 from .llm_trace import (
     LLMRequestEntry,
     LLMRequestListResponse,
@@ -347,6 +350,7 @@ from enum import Enum
 from ..pg0 import EmbeddedPostgres, parse_pg0_url
 from .entity_resolver import EntityResolver
 from .llm_wrapper import LLMConfig, requires_api_key, sanitize_llm_output, sanitize_text
+from .multi_llm import MultiLLMProvider
 from .query_analyzer import QueryAnalyzer
 from .reflect import run_reflect_agent
 from .reflect.tools import tool_expand, tool_recall, tool_search_mental_models, tool_search_observations
@@ -380,6 +384,64 @@ from .token_encoding import get_token_encoding
 
 RetainOutboxCallback = Callable[[asyncpg.Connection], Awaitable[None]]
 RetainOutboxCallbackFactory = Callable[[list[RetainContentDict]], RetainOutboxCallback | None]
+
+
+def _member_to_llm(member: "LLMMemberConfig", config: HindsightConfig) -> LLMConfig:
+    """Build an LLMProvider from one indexed multi-LLM member.
+
+    ``LLMProvider`` uses its arguments verbatim (it no longer reads global config),
+    so resolve each fallback here: a member's explicit value wins, otherwise inherit
+    the global LLM default. Fields that aren't per-member configurable
+    (``gemini_safety_settings``, ``prompt_cache_enabled``) take the global default.
+    ``gemini_safety_settings`` is bank-configurable so it comes from the raw config
+    (the proxy blocks it); the per-bank value is applied per-call downstream.
+    """
+    from ..config import _get_raw_config
+
+    return LLMConfig(
+        provider=member.provider,
+        api_key=member.api_key or "",
+        base_url=member.base_url,
+        model=member.model,
+        reasoning_effort=member.reasoning_effort or config.llm_reasoning_effort,
+        extra_body=member.extra_body,
+        default_headers=member.default_headers or config.llm_default_headers,
+        bedrock_service_tier=member.bedrock_service_tier,
+        gemini_service_tier=member.gemini_service_tier or config.llm_gemini_service_tier,
+        gemini_safety_settings=_get_raw_config().llm_gemini_safety_settings,
+        prompt_cache_enabled=config.llm_prompt_cache_enabled,
+        vertexai_project_id=member.vertexai_project_id or config.llm_vertexai_project_id,
+        vertexai_region=member.vertexai_region or config.llm_vertexai_region,
+        vertexai_service_account_key=member.vertexai_service_account_key or config.llm_vertexai_service_account_key,
+        litellmrouter_config=member.litellmrouter_config or config.llm_litellmrouter_config,
+    )
+
+
+def _build_llm(
+    base: LLMConfig,
+    config: HindsightConfig,
+    prefix: str,
+) -> "LLMConfig | MultiLLMProvider":
+    """Resolve an operation's multi-LLM chain and wrap ``base`` (member 0) in it.
+
+    ``prefix`` is ``""`` (global) or ``"retain_"`` / ``"reflect_"`` /
+    ``"consolidation_"``. A per-op slot with no indexed members (or no strategy)
+    inherits the global chain, mirroring how per-op base config falls back to the
+    global LLM config. Returns ``base`` unchanged when no chain is configured
+    (byte-identical hot path).
+    """
+    members: list[LLMMemberConfig] = getattr(config, f"{prefix}llm_members")
+    strategy: LLMStrategyConfig | None = getattr(config, f"{prefix}llm_strategy")
+    if prefix:
+        if not members:
+            members = config.llm_members
+        if strategy is None:
+            strategy = config.llm_strategy
+
+    if not strategy or not members:
+        return base
+    extra = [_member_to_llm(m, config) for m in members]
+    return MultiLLMProvider([base, *extra], strategy)
 
 
 def _is_oracledb_connection_error(e: Exception) -> bool:
@@ -744,6 +806,37 @@ def _resolve_refresh_tag_filtering(
     return RefreshTagFiltering(tags=model_tags, tags_match=tags_match, tag_groups=None)
 
 
+@dataclass
+class ResolvedDispositionMission:
+    """Disposition + mission after overlaying resolved bank config on the legacy columns."""
+
+    disposition: dict[str, int]
+    mission: str
+
+
+def _overlay_bank_config_disposition_mission(
+    disposition: dict[str, int], mission: str, config_dict: dict[str, Any]
+) -> ResolvedDispositionMission:
+    """Overlay resolved bank config on top of the legacy banks.disposition /
+    banks.mission column values.
+
+    ``reflect_mission`` and ``disposition_*`` in the resolved bank config take
+    precedence over the legacy DB columns. Shared by ``get_bank_profile`` and
+    ``list_banks`` so the single-bank and list paths return identical
+    disposition + mission for the same bank.
+    """
+    resolved_mission = config_dict.get("reflect_mission") or mission
+    cfg_skep = config_dict.get("disposition_skepticism")
+    cfg_lit = config_dict.get("disposition_literalism")
+    cfg_emp = config_dict.get("disposition_empathy")
+    resolved_disposition = {
+        "skepticism": cfg_skep if cfg_skep is not None else disposition["skepticism"],
+        "literalism": cfg_lit if cfg_lit is not None else disposition["literalism"],
+        "empathy": cfg_emp if cfg_emp is not None else disposition["empathy"],
+    }
+    return ResolvedDispositionMission(disposition=resolved_disposition, mission=resolved_mission)
+
+
 class MemoryEngine(MemoryEngineInterface):
     """
     Advanced memory system using temporal and semantic linking with PostgreSQL.
@@ -834,9 +927,15 @@ class MemoryEngine(MemoryEngineInterface):
                           HINDSIGHT_API_LAZY_RERANKER env var or False.
         """
         # Load config from environment for any missing parameters
-        from ..config import get_config
+        from ..config import _get_raw_config, get_config
 
         config = get_config()
+        # Gemini safety settings are bank-configurable, so the StaticConfigProxy from
+        # get_config() blocks reading them. The server-level default legitimately seeds
+        # each provider at construction (per-bank values are applied per-call via
+        # ConfiguredLLMProvider), so read it from the raw config. The other LLM fields
+        # below are static and safe to read off the proxy.
+        _llm_gemini_safety_settings = _get_raw_config().llm_gemini_safety_settings
 
         # Apply optimization flags from config if not explicitly provided
         self._skip_llm_verification = (
@@ -923,7 +1022,7 @@ class MemoryEngine(MemoryEngineInterface):
             self.query_analyzer = DateparserQueryAnalyzer()
 
         # Initialize LLM configuration (default, used as fallback)
-        self._llm_config = LLMConfig(
+        _default_base_llm = LLMConfig(
             provider=memory_llm_provider,
             api_key=memory_llm_api_key,
             base_url=memory_llm_base_url,
@@ -933,11 +1032,19 @@ class MemoryEngine(MemoryEngineInterface):
             default_headers=config.llm_default_headers,
             litellmrouter_config=config.llm_litellmrouter_config,
             bedrock_service_tier=config.llm_bedrock_service_tier,
+            gemini_service_tier=config.llm_gemini_service_tier,
+            gemini_safety_settings=_llm_gemini_safety_settings,
+            prompt_cache_enabled=config.llm_prompt_cache_enabled,
+            vertexai_project_id=config.llm_vertexai_project_id,
+            vertexai_region=config.llm_vertexai_region,
+            vertexai_service_account_key=config.llm_vertexai_service_account_key,
         )
+        self._llm_config = _build_llm(_default_base_llm, config, "")
 
-        # Store client and model for convenience (deprecated: use _llm_config.call() instead)
-        self._llm_client = self._llm_config._client
-        self._llm_model = self._llm_config.model
+        # Store client and model for convenience (deprecated: use _llm_config.call() instead).
+        # Read from the primary member so a multi-LLM chain behaves like the base config here.
+        self._llm_client = _default_base_llm._client
+        self._llm_model = _default_base_llm.model
 
         # Initialize per-operation LLM configs (fall back to default if not specified)
         # Retain LLM config - for fact extraction (benefits from strong structured output)
@@ -956,7 +1063,7 @@ class MemoryEngine(MemoryEngineInterface):
             else:
                 retain_base_url = ""
 
-        self._retain_llm_config = LLMConfig(
+        _retain_base_llm = LLMConfig(
             provider=retain_provider,
             api_key=retain_api_key,
             base_url=retain_base_url,
@@ -966,7 +1073,14 @@ class MemoryEngine(MemoryEngineInterface):
             default_headers=config.llm_default_headers,
             litellmrouter_config=config.retain_llm_litellmrouter_config or config.llm_litellmrouter_config,
             bedrock_service_tier=config.llm_bedrock_service_tier,
+            gemini_service_tier=config.llm_gemini_service_tier,
+            gemini_safety_settings=_llm_gemini_safety_settings,
+            prompt_cache_enabled=config.llm_prompt_cache_enabled,
+            vertexai_project_id=config.llm_vertexai_project_id,
+            vertexai_region=config.llm_vertexai_region,
+            vertexai_service_account_key=config.llm_vertexai_service_account_key,
         )
+        self._retain_llm_config = _build_llm(_retain_base_llm, config, "retain_")
 
         # Reflect LLM config - for think/observe operations (can use lighter models)
         reflect_provider = reflect_llm_provider or config.reflect_llm_provider or memory_llm_provider
@@ -984,7 +1098,7 @@ class MemoryEngine(MemoryEngineInterface):
             else:
                 reflect_base_url = ""
 
-        self._reflect_llm_config = LLMConfig(
+        _reflect_base_llm = LLMConfig(
             provider=reflect_provider,
             api_key=reflect_api_key,
             base_url=reflect_base_url,
@@ -994,7 +1108,14 @@ class MemoryEngine(MemoryEngineInterface):
             default_headers=config.llm_default_headers,
             litellmrouter_config=config.reflect_llm_litellmrouter_config or config.llm_litellmrouter_config,
             bedrock_service_tier=config.llm_bedrock_service_tier,
+            gemini_service_tier=config.llm_gemini_service_tier,
+            gemini_safety_settings=_llm_gemini_safety_settings,
+            prompt_cache_enabled=config.llm_prompt_cache_enabled,
+            vertexai_project_id=config.llm_vertexai_project_id,
+            vertexai_region=config.llm_vertexai_region,
+            vertexai_service_account_key=config.llm_vertexai_service_account_key,
         )
+        self._reflect_llm_config = _build_llm(_reflect_base_llm, config, "reflect_")
 
         # Consolidation LLM config - for mental model consolidation (can use efficient models)
         consolidation_provider = consolidation_llm_provider or config.consolidation_llm_provider or memory_llm_provider
@@ -1012,7 +1133,7 @@ class MemoryEngine(MemoryEngineInterface):
             else:
                 consolidation_base_url = ""
 
-        self._consolidation_llm_config = LLMConfig(
+        _consolidation_base_llm = LLMConfig(
             provider=consolidation_provider,
             api_key=consolidation_api_key,
             base_url=consolidation_base_url,
@@ -1022,7 +1143,14 @@ class MemoryEngine(MemoryEngineInterface):
             default_headers=config.llm_default_headers,
             litellmrouter_config=config.consolidation_llm_litellmrouter_config or config.llm_litellmrouter_config,
             bedrock_service_tier=config.llm_bedrock_service_tier,
+            gemini_service_tier=config.llm_gemini_service_tier,
+            gemini_safety_settings=_llm_gemini_safety_settings,
+            prompt_cache_enabled=config.llm_prompt_cache_enabled,
+            vertexai_project_id=config.llm_vertexai_project_id,
+            vertexai_region=config.llm_vertexai_region,
+            vertexai_service_account_key=config.llm_vertexai_service_account_key,
         )
+        self._consolidation_llm_config = _build_llm(_consolidation_base_llm, config, "consolidation_")
 
         # Initialize cross-encoder reranker (cached for performance)
         self._cross_encoder_reranker = CrossEncoderReranker(cross_encoder=cross_encoder)
@@ -1752,6 +1880,9 @@ class MemoryEngine(MemoryEngineInterface):
 
                 audit_entry.response = {"status": "completed", "operation_id": operation_id}
 
+            except ProviderRateLimitResetError as e:
+                logger.warning(f"Task deferred until provider quota resets at {e.retry_at}: {e}")
+                raise DeferOperation(exec_date=e.retry_at, reason=str(e)) from e
             except RetryTaskAt:
                 # Task-owned retry: let the poller handle scheduling
                 raise
@@ -2476,7 +2607,7 @@ class MemoryEngine(MemoryEngineInterface):
             provider becomes available (e.g. after a quota reset).
             """
             if not self._skip_llm_verification:
-                configs_to_verify: list[tuple[str, LLMConfig]] = [("default", self._llm_config)]
+                configs_to_verify: list[tuple[str, LLMConfig | MultiLLMProvider]] = [("default", self._llm_config)]
 
                 # Verify retain config if different from default
                 retain_is_different = (
@@ -2751,7 +2882,15 @@ class MemoryEngine(MemoryEngineInterface):
 
         self._parser_registry = FileParserRegistry()
         try:
-            self._parser_registry.register(MarkitdownParser())
+            self._parser_registry.register(
+                MarkitdownParser(
+                    ocr_enabled=config.file_parser_markitdown_ocr_enabled,
+                    ocr_api_key=config.file_parser_markitdown_ocr_api_key,
+                    ocr_base_url=config.file_parser_markitdown_ocr_base_url,
+                    ocr_model=config.file_parser_markitdown_ocr_model,
+                    ocr_prompt=config.file_parser_markitdown_ocr_prompt,
+                )
+            )
             logger.debug("Registered markitdown parser")
         except ImportError:
             logger.warning("markitdown not available - file parsing disabled")
@@ -3287,6 +3426,28 @@ class MemoryEngine(MemoryEngineInterface):
                 sub_doc_id = document_id or (sub_batch[0].get("document_id") if len(sub_batch) == 1 else None)
                 sub_offset = chunk_offsets.get(sub_doc_id, 0) if sub_doc_id else 0
 
+                # Count the chunks this sub-batch will produce BEFORE handing it
+                # to the orchestrator. retain_batch consumes (pops) each item's
+                # "content" while streaming, so reading it back after the call
+                # yields "" — and chunk_text("") returns [""] (count 1),
+                # advancing the per-document cursor by 1 regardless of the real
+                # chunk count. For slices that each span several chunks the next
+                # sub-batch then restarts ~1 slot in, colliding chunk_ids and
+                # overwriting earlier chunks (only ~1 new chunk survives per
+                # sub-batch). Capture it here while content is still present.
+                sub_chunk_count = 0
+                if sub_doc_id:
+                    sub_chunk_count = sum(
+                        len(
+                            fact_extraction.chunk_text(
+                                item.get("content", "") or "",
+                                chunking_config.chunk_size,
+                                structured_chunk_size=chunking_config.structured_chunk_size,
+                            )
+                        )
+                        for item in sub_batch
+                    )
+
                 sub_results, sub_usage, sub_processed = await self._retain_batch_async_internal(
                     bank_id=bank_id,
                     contents=sub_batch,
@@ -3306,20 +3467,10 @@ class MemoryEngine(MemoryEngineInterface):
                 )
 
                 # Advance the document's chunk_index cursor by the number of
-                # chunks this sub-batch produced (computed with the same chunk
-                # size the orchestrator uses), so the next sub-batch sharing the
-                # document continues the sequence.
+                # chunks this sub-batch produced (counted above, before the
+                # orchestrator consumed the content), so the next sub-batch
+                # sharing the document continues the sequence.
                 if sub_doc_id:
-                    sub_chunk_count = sum(
-                        len(
-                            fact_extraction.chunk_text(
-                                item.get("content", "") or "",
-                                chunking_config.chunk_size,
-                                structured_chunk_size=chunking_config.structured_chunk_size,
-                            )
-                        )
-                        for item in sub_batch
-                    )
                     # retain_batch only prepends the existing body on the global
                     # first sub-batch (is_first_batch == i == 1), so fold its chunk
                     # count in only there.
@@ -3383,6 +3534,8 @@ class MemoryEngine(MemoryEngineInterface):
                 llm_input_tokens=total_usage.input_tokens,
                 llm_output_tokens=total_usage.output_tokens,
                 llm_total_tokens=total_usage.total_tokens,
+                llm_cached_input_tokens=getattr(total_usage, "cached_tokens", 0) or 0,
+                llm_thoughts_tokens=getattr(total_usage, "thoughts_tokens", 0) or 0,
                 processed_content_tokens=total_processed_content_tokens,
             )
             try:
@@ -3784,6 +3937,10 @@ class MemoryEngine(MemoryEngineInterface):
         max_tokens: int = 4096,
         enable_trace: bool = False,
         fact_type: list[str] | None = None,
+        # Opt-in (default False). Internal callers that recall raw facts on purpose —
+        # notably consolidation, which needs the raw facts it folds into observations —
+        # must leave this off so they aren't silently deduped away.
+        prefer_observations: bool = False,
         question_date: datetime | None = None,
         include_entities: bool = False,
         max_entity_tokens: int = 500,
@@ -3816,6 +3973,10 @@ class MemoryEngine(MemoryEngineInterface):
             bank_id: bank ID to recall for
             query: Recall query
             fact_type: List of fact types to recall (e.g., ['world', 'experience'])
+            prefer_observations: When True and both 'observation' and a raw type ('world'/'experience')
+                       are requested, drop raw facts that a returned observation was consolidated from
+                       (deduplication by provenance). Freed slots backfill, keeping the result count at
+                       the budget. No-op unless both observation and raw types are requested.
             budget: Budget level for graph traversal (low=100, mid=300, high=600 units)
             max_tokens: Maximum tokens to return (counts only 'text' field, default 4096)
                        Results are returned until token budget is reached, stopping before
@@ -3953,6 +4114,7 @@ class MemoryEngine(MemoryEngineInterface):
                             max_chunk_tokens,
                             request_context,
                             semaphore_wait=semaphore_wait,
+                            prefer_observations=prefer_observations,
                             tags=tags,
                             tags_match=tags_match,
                             tag_groups=tag_groups,
@@ -4089,6 +4251,7 @@ class MemoryEngine(MemoryEngineInterface):
         max_chunk_tokens: int = 8192,
         request_context: "RequestContext" = None,
         semaphore_wait: float = 0.0,
+        prefer_observations: bool = False,
         tags: list[str] | None = None,
         tags_match: TagsMatch = "any",
         tag_groups: list[TagGroup] | None = None,
@@ -4136,7 +4299,10 @@ class MemoryEngine(MemoryEngineInterface):
         if tracer:
             tracer.start()
 
+        backend_acquire_start = time.time()
         backend = await self._get_read_backend()
+        if tracer:
+            tracer.add_phase_metric("backend_acquisition", time.time() - backend_acquire_start)
         recall_start = time.time()
 
         # Buffer logs for clean output in concurrent scenarios.
@@ -4432,10 +4598,12 @@ class MemoryEngine(MemoryEngineInterface):
                     },
                 )
                 # Also expose each retrieval method as its own phase so
-                # benchmarks can pinpoint which sub-query drives latency.
+                # benchmarks can pinpoint which sub-query drives latency. These are
+                # children of parallel_retrieval (marked diagnostic so the phase-coverage
+                # check doesn't double-count them).
                 for _method, _dur in aggregated_timings.items():
                     if _dur > 0:
-                        tracer.add_phase_metric(f"retrieval_{_method}", _dur)
+                        tracer.add_phase_metric(f"retrieval_{_method}", _dur, {"diagnostic": True})
 
             # Step 3: Merge ranked lists. RRF by default; interleave (round-robin) when
             # requested by consolidation dedup recall — RRF averages a strong-in-one-arm
@@ -4551,6 +4719,12 @@ class MemoryEngine(MemoryEngineInterface):
             # is_passthrough_reranker tells the scoring code to seed CE scores
             # from RRF rank — only meaningful when the configured reranker is
             # the slim/passthrough one that returns a constant score per pair.
+            #
+            # Timed separately from "reranking": the cross-encoder duration above
+            # (step_duration) is captured before this block runs, so the scoring
+            # math, additive boosts and final sort would otherwise be invisible in
+            # the phase metrics (issue #2361).
+            scoring_start = time.time()
             if scored_results and reranking == "interleave":
                 # Interleave order is authoritative for dedup recall: do NOT re-sort by the
                 # recency/temporal boosts — that re-sort is precisely what buried the twin
@@ -4563,10 +4737,14 @@ class MemoryEngine(MemoryEngineInterface):
                 ce = reranker_instance.cross_encoder
                 # "rrf" mode is passthrough by construction; so is a configured "rrf" CE.
                 is_passthrough = (reranking == "rrf") or (ce is not None and ce.provider_name == "rrf")
+                scoring_config = get_config()
                 apply_combined_scoring(
                     scored_results,
                     now=_recall_scoring_now(question_date),
                     is_passthrough_reranker=is_passthrough,
+                    recency_decay_function=scoring_config.recency_decay_function,
+                    recency_decay_linear_window_days=scoring_config.recency_decay_linear_window_days,
+                    recency_decay_halflife_days=scoring_config.recency_decay_halflife_days,
                 )
                 # Per-strategy additive boost: nudge candidates surfaced by a
                 # prioritised retrieval arm up the final ordering.
@@ -4594,12 +4772,68 @@ class MemoryEngine(MemoryEngineInterface):
                     step_duration,
                     {"reranker_type": rerank_kind, "candidates_reranked": len(scored_results)},
                 )
+                # Combined scoring + additive boosts + final sort, plus the trace
+                # serialization of reranked entries done just above.
+                tracer.add_phase_metric(
+                    "combined_scoring",
+                    time.time() - scoring_start,
+                    {"candidates_scored": len(scored_results)},
+                )
 
             # Cancellation checkpoint: reranking is done; skip the remaining
             # enrichment (chunk/entity/source-fact fetches, each its own DB work)
             # if the client disconnected while we were reranking (issue #2122).
             if request_context is not None:
                 request_context.raise_if_cancelled()
+
+            # Step 4.8: prefer-observations dedup. When the caller asked for observations
+            # alongside raw facts, an observation supersedes the raw facts it was
+            # consolidated from: drop those raw facts so the same content isn't returned
+            # twice. Runs BEFORE the Step 5 truncation so the freed slots backfill with
+            # the next-best results, keeping the result count at the budget. No-op unless
+            # 'observation' and at least one raw type were both requested.
+            raw_types_requested = {"world", "experience"} & set(fact_type)
+            if prefer_observations and "observation" in fact_type and raw_types_requested:
+                # "The observation list" = observations within the window we would return.
+                # Only those can supersede a raw fact; a far-down observation should not
+                # suppress a top raw fact it merely happens to reference.
+                observation_ids = [
+                    uuid.UUID(sr.id)
+                    for sr in scored_results[: thinking_budget * 2]
+                    if sr.retrieval.fact_type == "observation"
+                ]
+                if observation_ids:
+                    dedup_start = time.time()
+                    superseded_ids: set[str] = set()
+                    async with acquire_with_retry(backend) as dedup_conn:
+                        obs_rows = await dedup_conn.fetch(
+                            f"""
+                            SELECT source_memory_ids
+                            FROM {fq_table("memory_units")}
+                            WHERE id = ANY($1::uuid[]) AND fact_type = 'observation'
+                            """,
+                            observation_ids,
+                        )
+                    if tracer:
+                        tracer.add_phase_metric(
+                            "prefer_observations_dedup",
+                            time.time() - dedup_start,
+                            {"observations_considered": len(observation_ids)},
+                        )
+                    for obs_row in obs_rows:
+                        for sid in obs_row["source_memory_ids"] or []:
+                            superseded_ids.add(str(sid))
+                    if superseded_ids:
+                        before_count = len(scored_results)
+                        scored_results = [
+                            sr
+                            for sr in scored_results
+                            if not (sr.retrieval.fact_type in ("world", "experience") and sr.id in superseded_ids)
+                        ]
+                        log_buffer.append(
+                            f"  [4.8] prefer_observations: dropped {before_count - len(scored_results)} "
+                            f"raw fact(s) superseded by {len(observation_ids)} observation(s)"
+                        )
 
             # Step 5: Truncate to thinking_budget * 2 for token filtering
             rerank_limit = thinking_budget * 2
@@ -4610,6 +4844,7 @@ class MemoryEngine(MemoryEngineInterface):
             # Chunks are fetched independently of max_tokens filtering
             chunks_dict = None
             total_chunk_tokens = 0
+            chunk_fetch_start = time.time()
             if include_chunks and top_scored:
                 from .response_models import ChunkInfo
 
@@ -4718,6 +4953,15 @@ class MemoryEngine(MemoryEngineInterface):
                             )
                             total_chunk_tokens += chunk_tokens
 
+            # Chunk fetch involves up to two SQL round-trips plus per-chunk tiktoken
+            # encoding; record it only when chunks were actually requested (issue #2361).
+            if tracer and include_chunks:
+                tracer.add_phase_metric(
+                    "chunk_fetch",
+                    time.time() - chunk_fetch_start,
+                    {"chunks_returned": len(chunks_dict or {}), "chunk_tokens": total_chunk_tokens},
+                )
+
             # Step 6: Token budget filtering
             step_start = time.time()
 
@@ -4740,6 +4984,10 @@ class MemoryEngine(MemoryEngineInterface):
                     step_duration,
                     {"results_selected": len(top_scored), "tokens_used": total_tokens, "max_tokens": max_tokens},
                 )
+
+            # Record visits + build the JSON-serializable result dicts. Timed as one
+            # phase: the visit loop alone walks every scored result (issue #2361).
+            assembly_start = time.time()
 
             # Record visits for all retrieved nodes
             if tracer:
@@ -4790,7 +5038,15 @@ class MemoryEngine(MemoryEngineInterface):
                     )
                 top_results_dicts.append(result_dict)
 
+            if tracer:
+                tracer.add_phase_metric(
+                    "result_serialization",
+                    time.time() - assembly_start,
+                    {"results_serialized": len(top_results_dicts)},
+                )
+
             # Fetch source facts for observation-type results (mirrors chunks pattern)
+            source_fact_start = time.time()
             source_fact_ids_by_obs: dict[str, list[str]] = {}  # obs_id -> [source_id, ...]
             source_facts_dict: dict[str, MemoryFact] | None = None
             if include_source_facts:
@@ -4883,6 +5139,18 @@ class MemoryEngine(MemoryEngineInterface):
                                     source_facts_dict[sid] = _make_source_fact(sid, r)
                                     total_source_tokens += fact_tokens
 
+            # Source-fact enrichment is two SQL passes + tiktoken encoding; record it
+            # only when requested (issue #2361).
+            if tracer and include_source_facts:
+                tracer.add_phase_metric(
+                    "source_fact_fetch",
+                    time.time() - source_fact_start,
+                    {"source_facts_returned": len(source_facts_dict or {})},
+                )
+
+            # entity fetch + MemoryFact construction + entity-state build, timed together.
+            entity_build_start = time.time()
+
             # Get entities for each fact if include_entities is requested.
             # _entity_rows_for_units_sql resolves both direct unit_entities rows
             # and observation-via-source-memory inheritance in a single query.
@@ -4955,11 +5223,41 @@ class MemoryEngine(MemoryEngineInterface):
                         observations=[],  # Mental models provide this now
                     )
 
-            # Finalize trace if enabled
+            if tracer:
+                tracer.add_phase_metric(
+                    "entity_build",
+                    time.time() - entity_build_start,
+                    {"entities_returned": len(entities_dict or {})},
+                )
+
+                # Diagnostic phases — these do NOT partition the timeline and are
+                # excluded from the phase-coverage check (see test_trace_phase_coverage):
+                # the pool waits overlap other phases (semaphore_wait precedes the
+                # tracer window; connection_wait is part of parallel_retrieval), and the
+                # per-method retrieval splits are children of parallel_retrieval.
+                if semaphore_wait > 0:
+                    tracer.add_phase_metric("semaphore_wait", semaphore_wait, {"diagnostic": True})
+                if max_conn_wait > 0:
+                    tracer.add_phase_metric("connection_wait", max_conn_wait, {"diagnostic": True})
+
+            # Finalize trace if enabled. finalize() snapshots total_duration_seconds at
+            # entry, so its own object construction + to_dict() serialization fall outside
+            # that total; we still surface the cost as a diagnostic phase (issue #2361).
             trace_dict = None
             if tracer:
+                from .search.trace import SearchPhaseMetrics
+
+                finalize_start = time.time()
                 trace = tracer.finalize(top_results_dicts)
                 trace_dict = trace.to_dict() if trace else None
+                if trace_dict is not None:
+                    trace_dict["summary"]["phase_metrics"].append(
+                        SearchPhaseMetrics(
+                            phase_name="trace_finalize",
+                            duration_seconds=time.time() - finalize_start,
+                            details={"diagnostic": True},
+                        ).model_dump()
+                    )
 
             # Log final recall stats
             total_time = time.time() - recall_start
@@ -5275,6 +5573,17 @@ class MemoryEngine(MemoryEngineInterface):
                     "memory_units_deleted": units_count if deleted else 0,
                 }
 
+        # Drop any cached stats for this bank — deleting the document changed
+        # the document count and (via cascade) the memory-unit/link counts
+        # get_bank_stats reports, which the TTL would otherwise serve at
+        # pre-delete values for up to a minute (mirrors delete_bank). Best-effort:
+        # a cache-eviction failure must not fail an already-committed delete.
+        if deleted:
+            try:
+                await self._bank_stats_cache.invalidate(get_current_schema(), bank_id)
+            except Exception as e:
+                logger.warning(f"Failed to invalidate bank stats cache after document deletion for bank {bank_id}: {e}")
+
         if invalidated_obs > 0:
             config = await self._config_resolver.resolve_full_config(bank_id, request_context)
             if config.enable_auto_consolidation:
@@ -5442,6 +5751,14 @@ class MemoryEngine(MemoryEngineInterface):
                             )
 
         if invalidated_obs > 0:
+            # Observation units were deleted, changing the counts get_bank_stats
+            # reports — drop the cached stats so the TTL does not serve pre-update
+            # values for up to a minute (mirrors delete_bank). Best-effort: a
+            # cache-eviction failure must not fail an already-committed update.
+            try:
+                await self._bank_stats_cache.invalidate(get_current_schema(), bank_id)
+            except Exception as e:
+                logger.warning(f"Failed to invalidate bank stats cache after document update for bank {bank_id}: {e}")
             config = await self._config_resolver.resolve_full_config(bank_id, request_context)
             if config.enable_auto_consolidation:
                 try:
@@ -5532,6 +5849,19 @@ class MemoryEngine(MemoryEngineInterface):
                     if deleted
                     else "Memory unit not found",
                 }
+
+        # Drop any cached stats for this bank — the deleted unit (and its
+        # cascaded links/entities) changed the counts get_bank_stats reports,
+        # which the TTL would otherwise serve at pre-delete values for up to a
+        # minute (mirrors delete_bank). Best-effort: a cache-eviction failure
+        # must not fail an already-committed delete.
+        if deleted and bank_id:
+            try:
+                await self._bank_stats_cache.invalidate(get_current_schema(), bank_id)
+            except Exception as e:
+                logger.warning(
+                    f"Failed to invalidate bank stats cache after memory unit deletion for bank {bank_id}: {e}"
+                )
 
         if bank_id_for_consolidation:
             config = await self._config_resolver.resolve_full_config(bank_id_for_consolidation, request_context)
@@ -5755,7 +6085,17 @@ class MemoryEngine(MemoryEngineInterface):
                     bank_id,
                 )
 
-                return {"deleted_count": count or 0}
+        # Drop any cached stats for this bank — clearing observations changed
+        # the memory-unit/observation counts and the consolidation timestamps
+        # get_bank_stats reports, which the TTL would otherwise serve at stale
+        # values for up to a minute (mirrors delete_bank). Best-effort: a
+        # cache-eviction failure must not fail an already-committed clear.
+        try:
+            await self._bank_stats_cache.invalidate(get_current_schema(), bank_id)
+        except Exception as e:
+            logger.warning(f"Failed to invalidate bank stats cache after clearing observations for bank {bank_id}: {e}")
+
+        return {"deleted_count": count or 0}
 
     async def list_observation_scopes(
         self,
@@ -6804,10 +7144,11 @@ class MemoryEngine(MemoryEngineInterface):
             setattr(resolved_config, key, value)
 
         backend = await self._get_backend()
-        # Narrator primes the "Narrator:" line in the prompt — resolve it the same way retain does.
+        # Narrator primes the "Narrator:" line in the prompt. Dry-run must not
+        # create a bank just to resolve that optional display name.
         if agent_name is None:
-            profile = await bank_utils.get_bank_profile(backend, bank_id)
-            profile_name = profile["name"] if profile else bank_id
+            profile = await bank_utils.get_bank_profile_if_exists(backend, bank_id)
+            profile_name = profile["name"] if profile is not None else bank_id
             agent_name = None if profile_name == bank_id else profile_name
 
         retain_llm = self._retain_llm_config.with_config(resolved_config, bank_id=bank_id, operation="retain")
@@ -8112,25 +8453,15 @@ class MemoryEngine(MemoryEngineInterface):
 
         # reflect_mission and disposition in config take precedence over the legacy DB columns
         config_dict = await self._config_resolver.get_bank_config(bank_id, request_context)
-        mission = config_dict.get("reflect_mission") or profile["mission"]
-
-        # Overlay disposition from config if explicitly set; fall back to DB values
         db_disp = profile["disposition"]
         db_disp_dict = db_disp.model_dump() if hasattr(db_disp, "model_dump") else dict(db_disp)
-        cfg_skep = config_dict.get("disposition_skepticism")
-        cfg_lit = config_dict.get("disposition_literalism")
-        cfg_emp = config_dict.get("disposition_empathy")
-        disposition = {
-            "skepticism": cfg_skep if cfg_skep is not None else db_disp_dict["skepticism"],
-            "literalism": cfg_lit if cfg_lit is not None else db_disp_dict["literalism"],
-            "empathy": cfg_emp if cfg_emp is not None else db_disp_dict["empathy"],
-        }
+        resolved = _overlay_bank_config_disposition_mission(db_disp_dict, profile["mission"], config_dict)
 
         return {
             "bank_id": bank_id,
             "name": profile["name"],
-            "disposition": disposition,
-            "mission": mission,
+            "disposition": resolved.disposition,
+            "mission": resolved.mission,
         }
 
     async def _ensure_bank_exists(
@@ -8345,6 +8676,17 @@ class MemoryEngine(MemoryEngineInterface):
                 BankListContext(banks=banks, request_context=request_context)
             )
             banks = result.banks
+        # Overlay resolved bank config (reflect_mission + disposition_*) on top of the
+        # legacy banks.disposition / banks.mission columns, mirroring get_bank_profile so
+        # the list and get paths return identical disposition + mission for a bank.
+        # Resolve every bank's config in one batch (single config-column query + a single
+        # tenant-config resolve) rather than one round-trip per bank.
+        configs = await self._config_resolver.get_bank_configs([bank["bank_id"] for bank in banks], request_context)
+        for bank in banks:
+            resolved = _overlay_bank_config_disposition_mission(
+                bank["disposition"], bank["mission"], configs.get(bank["bank_id"], {})
+            )
+            bank["disposition"], bank["mission"] = resolved.disposition, resolved.mission
         return banks
 
     # ==================== Reflect Methods ====================
@@ -11105,7 +11447,8 @@ class MemoryEngine(MemoryEngineInterface):
                         "id": str(row["operation_id"]),
                         "task_type": row["operation_type"],
                         "items_count": result_metadata.get("items_count", 0),
-                        "document_id": None,
+                        "document_id": result_metadata.get("document_id"),
+                        "filename": result_metadata.get("original_filename"),
                         "created_at": row["created_at"].isoformat(),
                         "updated_at": row["updated_at"].isoformat() if row["updated_at"] else None,
                         "status": row["status"],
@@ -11695,6 +12038,8 @@ class MemoryEngine(MemoryEngineInterface):
             **task_payload,
         }
 
+        from hindsight_api.extensions.operation_validator import OperationValidationError
+
         async with acquire_with_retry(backend) as conn:
             async with conn.transaction():
                 if dedupe_by_bank:
@@ -11716,10 +12061,20 @@ class MemoryEngine(MemoryEngineInterface):
                     # serialize) but not with FOR KEY SHARE (so those inserts proceed).
                     # On Oracle this rewrites to FOR UPDATE, which there does not block
                     # indexed-FK child inserts.
-                    await conn.execute(
+                    #
+                    # Use fetchval so we can also verify the bank actually exists.
+                    # Without this check, callers that race against bank deletion
+                    # or that derive bank IDs before creating the bank reach the
+                    # INSERT below and get an asyncpg.ForeignKeyViolationError, which
+                    # surfaces as an opaque 500 from the API. A clean
+                    # OperationValidationError(404) is the right shape — the FastAPI
+                    # handler already converts it via its existing except clause.
+                    bank_exists = await conn.fetchval(
                         f"SELECT 1 FROM {fq_table('banks')} WHERE bank_id = $1 FOR NO KEY UPDATE",
                         bank_id,
                     )
+                    if bank_exists is None:
+                        raise OperationValidationError(f"Bank '{bank_id}' not found", status_code=404)
                     # Only check 'pending', not 'processing': a processing task uses a
                     # watermark from when it started, so memories added after that need
                     # a fresh run regardless.
@@ -11749,6 +12104,16 @@ class MemoryEngine(MemoryEngineInterface):
                                 "operation_id": str(row["operation_id"]),
                                 "deduplicated": True,
                             }
+                else:
+                    # Scoped/non-dedupe submits skip the lock + dedup above.
+                    # Still verify the bank exists so an FK violation can't
+                    # escape as a 500.
+                    bank_exists = await conn.fetchval(
+                        f"SELECT 1 FROM {fq_table('banks')} WHERE bank_id = $1",
+                        bank_id,
+                    )
+                    if bank_exists is None:
+                        raise OperationValidationError(f"Bank '{bank_id}' not found", status_code=404)
 
                 await conn.execute(
                     f"""
@@ -12068,6 +12433,7 @@ class MemoryEngine(MemoryEngineInterface):
                 task_payload=task_payload,
                 result_metadata={
                     "original_filename": file.filename,
+                    "document_id": item["document_id"],
                 },
                 dedupe_by_bank=False,
             )

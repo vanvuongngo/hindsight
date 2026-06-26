@@ -346,6 +346,149 @@ async def test_markitdown_converter():
     assert "test document" in result.lower() or "multiple lines" in result.lower()
 
 
+def test_markitdown_converter_does_not_enable_ocr_by_default(monkeypatch):
+    """Markitdown should keep its local/default behavior unless OCR is explicitly enabled."""
+    import markitdown
+
+    from hindsight_api.engine.parsers import MarkitdownParser
+
+    calls = []
+
+    class FakeMarkItDown:
+        def __init__(self, **kwargs):
+            calls.append(kwargs)
+
+    monkeypatch.setattr(markitdown, "MarkItDown", FakeMarkItDown)
+
+    MarkitdownParser()
+
+    assert calls == [{}]
+
+
+@pytest.mark.asyncio
+async def test_markitdown_image_without_ocr_has_actionable_error(monkeypatch):
+    """Image uploads should explain that MarkItDown OCR is disabled instead of surfacing a low-level error."""
+    import markitdown
+
+    from hindsight_api.engine.parsers import MarkitdownParser
+
+    class FakeMarkItDown:
+        def __init__(self, **kwargs):
+            pass
+
+        def convert(self, path):
+            raise AssertionError("MarkItDown should not be called when image OCR is disabled")
+
+    monkeypatch.setattr(markitdown, "MarkItDown", FakeMarkItDown)
+
+    parser = MarkitdownParser()
+    with pytest.raises(RuntimeError, match="Image OCR is not enabled for the markitdown parser"):
+        await parser.convert(b"\x89PNG\r\n\x1a\n", "screenshot.png")
+
+
+def test_markitdown_converter_can_enable_ocr(monkeypatch):
+    """When enabled, Markitdown receives an OpenAI-compatible client, model, and OCR prompt."""
+    import markitdown
+    import openai
+
+    from hindsight_api.config import DEFAULT_FILE_PARSER_MARKITDOWN_OCR_PROMPT
+    from hindsight_api.engine.parsers import MarkitdownParser
+
+    markitdown_calls = []
+    openai_calls = []
+
+    class FakeMarkItDown:
+        def __init__(self, **kwargs):
+            markitdown_calls.append(kwargs)
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            openai_calls.append(kwargs)
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr(markitdown, "MarkItDown", FakeMarkItDown)
+    monkeypatch.setattr(openai, "OpenAI", FakeOpenAI)
+
+    MarkitdownParser(
+        ocr_enabled=True,
+        ocr_api_key="parser-key",
+        ocr_base_url="https://vision.example/v1",
+        ocr_model="vision-model",
+    )
+
+    assert openai_calls == [
+        {
+            "api_key": "parser-key",
+            "base_url": "https://vision.example/v1",
+        }
+    ]
+    assert markitdown_calls[0]["llm_client"].__class__ is FakeOpenAI
+    assert markitdown_calls[0]["llm_model"] == "vision-model"
+    assert markitdown_calls[0]["llm_prompt"] == DEFAULT_FILE_PARSER_MARKITDOWN_OCR_PROMPT
+
+
+def test_markitdown_converter_requires_model_when_ocr_enabled(monkeypatch):
+    """OCR should fail fast when enabled without a model."""
+    import markitdown
+
+    from hindsight_api.engine.parsers import MarkitdownParser
+
+    class FakeMarkItDown:
+        def __init__(self, **kwargs):
+            pass
+
+    monkeypatch.setattr(markitdown, "MarkItDown", FakeMarkItDown)
+
+    with pytest.raises(ValueError, match="no model"):
+        MarkitdownParser(ocr_enabled=True, ocr_api_key="parser-key")
+
+
+def test_markitdown_converter_requires_base_url_when_ocr_enabled(monkeypatch):
+    """OCR should fail fast when enabled without a dedicated OpenAI-compatible endpoint."""
+    import markitdown
+
+    from hindsight_api.engine.parsers import MarkitdownParser
+
+    class FakeMarkItDown:
+        def __init__(self, **kwargs):
+            pass
+
+    monkeypatch.setattr(markitdown, "MarkItDown", FakeMarkItDown)
+
+    with pytest.raises(ValueError, match="no base URL"):
+        MarkitdownParser(ocr_enabled=True, ocr_api_key="parser-key", ocr_model="vision-model")
+
+
+def test_markitdown_converter_reports_missing_openai_when_ocr_enabled(monkeypatch):
+    """Missing OpenAI SDK should not be reported as missing MarkItDown."""
+    import builtins
+    import markitdown
+
+    from hindsight_api.engine.parsers import MarkitdownParser
+
+    real_import = builtins.__import__
+
+    class FakeMarkItDown:
+        def __init__(self, **kwargs):
+            pass
+
+    def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "openai":
+            raise ImportError("no openai")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(markitdown, "MarkItDown", FakeMarkItDown)
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+
+    with pytest.raises(RuntimeError, match="openai package is required"):
+        MarkitdownParser(
+            ocr_enabled=True,
+            ocr_api_key="parser-key",
+            ocr_base_url="https://vision.example/v1",
+            ocr_model="vision-model",
+        )
+
+
 @pytest.mark.asyncio
 async def test_converter_registry():
     """Test file parser registry."""
@@ -472,6 +615,59 @@ async def test_file_conversion_creates_separate_retain_operation(memory_no_llm_v
     assert doc["file_content_type"] == "text/plain"
     assert doc["original_text"] is not None
     assert len(doc["original_text"]) > 0
+
+
+@pytest.mark.asyncio
+async def test_list_operations_surfaces_file_document_id_and_filename(memory_no_llm_verify, sample_txt_content):
+    """list_operations must expose document_id + filename for file_convert_retain ops.
+
+    The control plane derives its pending-upload rows from these fields (it
+    matches an in-flight operation to the real document via document_id and
+    labels the row with the original filename), so both must round-trip from
+    the operation's result_metadata into the list response.
+    """
+    from hindsight_api.models import RequestContext
+
+    bank_id = "test_file_op_fields_bank"
+    context = RequestContext(internal=True)
+    await memory_no_llm_verify.get_bank_profile(bank_id, request_context=context)
+
+    class MockFile:
+        def __init__(self, content, filename, content_type):
+            self.content = content
+            self.filename = filename
+            self.content_type = content_type
+
+        async def read(self):
+            return self.content
+
+    file_items = [
+        {
+            "file": MockFile(sample_txt_content, "report.txt", "text/plain"),
+            "document_id": "doc_op_fields",
+            "context": None,
+            "metadata": {},
+            "tags": [],
+            "timestamp": None,
+            "parser": ["markitdown"],
+        }
+    ]
+
+    await memory_no_llm_verify.submit_async_file_retain(
+        bank_id=bank_id,
+        file_items=file_items,
+        document_tags=None,
+        request_context=context,
+    )
+
+    result = await memory_no_llm_verify.list_operations(
+        bank_id, task_type="file_convert_retain", request_context=context
+    )
+
+    file_ops = [op for op in result["operations"] if op["task_type"] == "file_convert_retain"]
+    assert len(file_ops) == 1
+    assert file_ops[0]["document_id"] == "doc_op_fields"
+    assert file_ops[0]["filename"] == "report.txt"
 
 
 @pytest.mark.asyncio

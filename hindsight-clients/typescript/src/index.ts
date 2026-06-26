@@ -60,6 +60,7 @@ import type {
   MentalModelListResponse,
   MentalModelResponse,
   UpdateDocumentResponse,
+  VersionResponse,
 } from "../generated/types.gen";
 
 // __CLIENT_VERSION__ is replaced by tsup's `define` with package.json's version
@@ -135,6 +136,18 @@ export class HindsightClient {
         headers,
       })
     );
+  }
+
+  /**
+   * Get API version and feature flags for the connected Hindsight deployment.
+   */
+  async getVersion(options?: { signal?: AbortSignal }): Promise<VersionResponse> {
+    const response = await sdk.getVersion({
+      client: this.client,
+      signal: options?.signal,
+    });
+
+    return this.validateResponse(response, "getVersion");
   }
 
   /**
@@ -304,6 +317,8 @@ export class HindsightClient {
     query: string,
     options?: {
       types?: string[];
+      /** When recalling raw facts ('world'/'experience') together with 'observation', drop any raw fact a returned observation was consolidated from, so the observation supersedes it (no duplicate content). Disabled by default; no effect unless 'observation' and at least one raw type are both in types. */
+      preferObservations?: boolean;
       maxTokens?: number;
       budget?: Budget;
       trace?: boolean;
@@ -331,6 +346,7 @@ export class HindsightClient {
       body: {
         query,
         types: options?.types,
+        prefer_observations: options?.preferObservations,
         max_tokens: options?.maxTokens,
         budget: options?.budget || "mid",
         trace: options?.trace,
@@ -1098,6 +1114,7 @@ export type {
   MentalModelListResponse,
   MentalModelResponse,
   UpdateDocumentResponse,
+  VersionResponse,
 };
 
 // Also export low-level SDK functions for advanced usage

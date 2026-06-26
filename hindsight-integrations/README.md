@@ -13,6 +13,8 @@ Each integration lives in its own subdirectory with its own README, configuratio
 | [**Codex CLI**](./codex) | Python hook scripts for OpenAI's Codex CLI. Auto-recall on `UserPromptSubmit`, auto-retain on `Stop`. | `curl -fsSL https://hindsight.vectorize.io/get-codex \| bash` |
 | [**Cursor CLI**](./cursor-cli) | Python hook scripts for Cursor CLI. Auto-recall on `beforeSubmitPrompt`, auto-retain on `stop`, final flush on `sessionEnd`. | `./scripts/install.sh` |
 | [**Continue.dev**](./continue) | HTTP context provider for precise `@hindsight` recall in chat, plus optional MCP-server + rules for automatic recall/retain in agent mode. | `pip install hindsight-continue` |
+| [**GitHub Copilot**](./github-copilot) | MCP server config (`.vscode/mcp.json`) + a recall/retain rule for VS Code Copilot's agent mode. | `pip install hindsight-copilot` |
+| [**Windsurf**](./windsurf) | Native MCP server config + always-on recall/retain rule for Windsurf (Codeium) Cascade. | `pip install hindsight-windsurf` |
 | [**Roo Code**](./roo-code) | Persistent memory for Roo Code VS Code extension. | See README |
 | [**Hermes (OpenAI Agents SDK)**](./hermes) | Memory layer for OpenAI Agents SDK. | See README |
 | [**Grok Build**](./grok-build) | Hooks for Grok Build (xAI). | See README |
@@ -33,7 +35,9 @@ Each integration lives in its own subdirectory with its own README, configuratio
 | [**Strands Agents**](./strands) | Retain/recall/reflect tools for Strands. |
 | [**AG2**](./ag2) | Cross-conversation memory tools. |
 | [**AutoGen**](./autogen) | `FunctionTool` instances for retain/recall/reflect. |
+| [**Aider**](./aider) | `hindsight-aider` wraps the `aider` CLI — recalls project memory before each session, retains the transcript after. |
 | [**OpenAI Agents SDK**](./openai-agents) | `FunctionTool`-based memory. |
+| [**OpenHands**](./openhands) | Native MCP server config + recall/retain rule for OpenHands (formerly OpenDevin). |
 | [**NemoClaw**](./nemoclaw) | One-command setup for NemoClaw sandboxes. |
 | [**Right Agent**](./right-agent) | Native memory provider for Right Agent sandboxes. |
 | [**Pipecat**](./pipecat) | Memory nodes for Pipecat voice pipelines. |

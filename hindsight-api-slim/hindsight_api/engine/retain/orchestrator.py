@@ -834,6 +834,28 @@ async def retain_batch(
             if first.get("tags"):
                 existing_content["tags"] = first["tags"]
             contents_dicts = [existing_content, *contents_dicts]
+            # Merge JSON arrays to keep original_text valid (#2409).
+            # Without this, combined_content joins items with "\n", producing
+            # "[...]\n[...]" which is not valid JSON. On the next append cycle
+            # chunk_text() fails to parse it and falls through to sentence-
+            # boundary text splitting, breaking speaker attribution.
+            try:
+                _merged = []
+                for _item in contents_dicts:
+                    _parsed = json.loads(_item.get("content", ""))
+                    if isinstance(_parsed, list) and all(isinstance(_e, dict) for _e in _parsed):
+                        _merged.extend(_parsed)
+                    else:
+                        _merged = None
+                        break
+                if _merged is not None:
+                    contents_dicts = [{"content": json.dumps(_merged, ensure_ascii=False)}]
+                    if first.get("context"):
+                        contents_dicts[0]["context"] = first["context"]
+                    if first.get("tags"):
+                        contents_dicts[0]["tags"] = first["tags"]
+            except (json.JSONDecodeError, ValueError, TypeError):
+                pass
             # Rebuild contents list to match
             contents = _build_contents(contents_dicts, document_tags)
             log_buffer.append(
@@ -1615,8 +1637,19 @@ async def _streaming_retain_batch(
     # Check if facts are already committed (recovery from previous crash).
     # If so, skip extraction+writes and jump straight to final ANN pass.
     # ---------------------------------------------------------------------------
+    # Only the call that starts a document at chunk 0 may take the whole-document
+    # skip. When an oversized single item is split into several sequential
+    # sub-batches that SHARE one document_id AND one operation_id (see
+    # _split_contents_into_sub_batches), the first sub-batch commits its chunks
+    # and stamps effective_doc_id into result_metadata.facts_committed_document_ids.
+    # Without the offset gate, every later sub-batch (chunk_index_offset > 0) would
+    # then see its own document already "committed" and skip extraction, dropping
+    # all chunks past the first slice. A non-zero offset inherently means this call
+    # continues a document another sub-batch already started, so it must always do
+    # its work — crash-safety for those chunks still comes from the per-chunk hash
+    # recovery (existing_chunk_hashes) below.
     facts_already_committed = False
-    if operation_id:
+    if operation_id and chunk_index_offset == 0:
         try:
             async with acquire_with_retry(pool) as conn:
                 row = await conn.fetchrow(

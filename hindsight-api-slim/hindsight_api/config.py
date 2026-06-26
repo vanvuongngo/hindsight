@@ -142,10 +142,21 @@ ENV_LLM_REASONING_EFFORT = "HINDSIGHT_API_LLM_REASONING_EFFORT"
 ENV_LLM_GROQ_SERVICE_TIER = "HINDSIGHT_API_LLM_GROQ_SERVICE_TIER"
 ENV_LLM_OPENAI_SERVICE_TIER = "HINDSIGHT_API_LLM_OPENAI_SERVICE_TIER"
 ENV_LLM_BEDROCK_SERVICE_TIER = "HINDSIGHT_API_LLM_BEDROCK_SERVICE_TIER"
+ENV_LLM_GEMINI_SERVICE_TIER = "HINDSIGHT_API_LLM_GEMINI_SERVICE_TIER"
 ENV_LLM_EXTRA_BODY = "HINDSIGHT_API_LLM_EXTRA_BODY"
 ENV_LLM_DEFAULT_HEADERS = "HINDSIGHT_API_LLM_DEFAULT_HEADERS"
 ENV_LLM_STRICT_SCHEMA = "HINDSIGHT_API_LLM_STRICT_SCHEMA"
 ENV_LLM_SEND_BANK_AS_USER = "HINDSIGHT_API_LLM_SEND_BANK_AS_USER"
+
+# Multi-LLM strategy. Extra LLMs are configured by index alongside the unindexed
+# primary (e.g. HINDSIGHT_API_LLM_1_PROVIDER, HINDSIGHT_API_LLM_2_PROVIDER, ...),
+# and HINDSIGHT_API_LLM_STRATEGY (JSON) selects how to route across them — see
+# _parse_llm_members / _parse_llm_strategy below. Each operation can override the
+# global chain with its own HINDSIGHT_API_<OP>_LLM_<n>_* members + _STRATEGY.
+ENV_LLM_STRATEGY = "HINDSIGHT_API_LLM_STRATEGY"
+ENV_RETAIN_LLM_STRATEGY = "HINDSIGHT_API_RETAIN_LLM_STRATEGY"
+ENV_REFLECT_LLM_STRATEGY = "HINDSIGHT_API_REFLECT_LLM_STRATEGY"
+ENV_CONSOLIDATION_LLM_STRATEGY = "HINDSIGHT_API_CONSOLIDATION_LLM_STRATEGY"
 
 # LiteLLM Router chain — provider-specific config consumed by the "litellmrouter"
 # provider. Each entry is a deployment; the Router tries them in declared order and
@@ -159,10 +170,24 @@ ENV_LLM_LITELLMROUTER_CONFIG = "HINDSIGHT_API_LLM_LITELLMROUTER_CONFIG"
 DEFAULT_LLM_GROQ_SERVICE_TIER = "auto"  # "on_demand", "flex", or "auto"
 DEFAULT_LLM_OPENAI_SERVICE_TIER = None  # None (default) or "flex" (50% cheaper)
 DEFAULT_LLM_BEDROCK_SERVICE_TIER = None  # None (default), "flex", "priority", or "reserved"
+DEFAULT_LLM_GEMINI_SERVICE_TIER = None  # None (default) or "flex" (50% cheaper best-effort tier)
 DEFAULT_LLM_EXTRA_BODY = None  # None = no extra body params; JSON dict merged into OpenAI extra_body
 DEFAULT_LLM_DEFAULT_HEADERS = (
     None  # None = no extra headers; JSON dict passed as default_headers to provider SDK clients
 )
+
+
+def parse_gemini_service_tier(value: str | None) -> str | None:
+    """Normalize and validate the Gemini service tier."""
+    tier = value or None
+    valid_tiers = (None, "flex")
+    if tier not in valid_tiers:
+        raise ValueError(
+            f"Invalid HINDSIGHT_API_LLM_GEMINI_SERVICE_TIER: "
+            f"{tier!r}. Must be one of: {', '.join(t for t in valid_tiers if t is not None)}."
+        )
+    return tier
+
 
 # Per-operation LLM configuration (optional, falls back to global LLM config)
 ENV_RETAIN_LLM_PROVIDER = "HINDSIGHT_API_RETAIN_LLM_PROVIDER"
@@ -354,6 +379,7 @@ ENV_ACCESS_LOG = "HINDSIGHT_API_ACCESS_LOG"
 ENV_MCP_ENABLED = "HINDSIGHT_API_MCP_ENABLED"
 ENV_MCP_ENABLED_TOOLS = "HINDSIGHT_API_MCP_ENABLED_TOOLS"
 ENV_MCP_STATELESS = "HINDSIGHT_API_MCP_STATELESS"
+ENV_MCP_INSTRUCTIONS = "HINDSIGHT_API_MCP_INSTRUCTIONS"
 ENV_ENABLE_BANK_CONFIG_API = "HINDSIGHT_API_ENABLE_BANK_CONFIG_API"
 ENV_ENABLE_BANK_LLM_HEALTH = "HINDSIGHT_API_ENABLE_BANK_LLM_HEALTH"
 ENV_ENABLE_DRY_RUN_EXTRACT = "HINDSIGHT_API_ENABLE_DRY_RUN_EXTRACT"
@@ -375,6 +401,7 @@ ENV_OTEL_EXPORTER_OTLP_HEADERS = "HINDSIGHT_API_OTEL_EXPORTER_OTLP_HEADERS"
 ENV_OTEL_SERVICE_NAME = "HINDSIGHT_API_OTEL_SERVICE_NAME"
 ENV_OTEL_DEPLOYMENT_ENVIRONMENT = "HINDSIGHT_API_OTEL_DEPLOYMENT_ENVIRONMENT"
 ENV_METRICS_INCLUDE_BANK_ID = "HINDSIGHT_API_METRICS_INCLUDE_BANK_ID"
+ENV_METRICS_BACKLOG_ENABLED = "HINDSIGHT_API_METRICS_BACKLOG_ENABLED"
 
 # Vertex AI configuration
 ENV_LLM_VERTEXAI_PROJECT_ID = "HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID"
@@ -424,6 +451,11 @@ ENV_FILE_STORAGE_AZURE_ACCOUNT_NAME = "HINDSIGHT_API_FILE_STORAGE_AZURE_ACCOUNT_
 ENV_FILE_STORAGE_AZURE_ACCOUNT_KEY = "HINDSIGHT_API_FILE_STORAGE_AZURE_ACCOUNT_KEY"
 ENV_FILE_PARSER = "HINDSIGHT_API_FILE_PARSER"
 ENV_FILE_PARSER_ALLOWLIST = "HINDSIGHT_API_FILE_PARSER_ALLOWLIST"
+ENV_FILE_PARSER_MARKITDOWN_OCR_ENABLED = "HINDSIGHT_API_FILE_PARSER_MARKITDOWN_OCR_ENABLED"
+ENV_FILE_PARSER_MARKITDOWN_OCR_API_KEY = "HINDSIGHT_API_FILE_PARSER_MARKITDOWN_OCR_API_KEY"
+ENV_FILE_PARSER_MARKITDOWN_OCR_BASE_URL = "HINDSIGHT_API_FILE_PARSER_MARKITDOWN_OCR_BASE_URL"
+ENV_FILE_PARSER_MARKITDOWN_OCR_MODEL = "HINDSIGHT_API_FILE_PARSER_MARKITDOWN_OCR_MODEL"
+ENV_FILE_PARSER_MARKITDOWN_OCR_PROMPT = "HINDSIGHT_API_FILE_PARSER_MARKITDOWN_OCR_PROMPT"
 ENV_FILE_PARSER_IRIS_TOKEN = "HINDSIGHT_API_FILE_PARSER_IRIS_TOKEN"
 ENV_FILE_PARSER_IRIS_ORG_ID = "HINDSIGHT_API_FILE_PARSER_IRIS_ORG_ID"
 ENV_FILE_PARSER_LLAMA_PARSE_API_KEY = "HINDSIGHT_API_FILE_PARSER_LLAMA_PARSE_API_KEY"
@@ -553,6 +585,14 @@ ENV_RECALL_MAX_CANDIDATES_PER_SOURCE = "HINDSIGHT_API_RECALL_MAX_CANDIDATES_PER_
 # Empty disables the feature.
 ENV_RECALL_STRATEGY_BOOSTS = "HINDSIGHT_API_RECALL_STRATEGY_BOOSTS"
 
+# Recency decay used by recall reranking (engine/search/reranking.py). The decay
+# function maps a memory's age onto a freshness signal that nudges its final
+# ranking via a small multiplicative boost. "linear" (default) preserves the
+# historical behaviour; "exponential" decays by half-life; "none" disables it.
+ENV_RECENCY_DECAY_FUNCTION = "HINDSIGHT_API_RECENCY_DECAY_FUNCTION"
+ENV_RECENCY_DECAY_LINEAR_WINDOW_DAYS = "HINDSIGHT_API_RECENCY_DECAY_LINEAR_WINDOW_DAYS"
+ENV_RECENCY_DECAY_HALFLIFE_DAYS = "HINDSIGHT_API_RECENCY_DECAY_HALFLIFE_DAYS"
+
 # Audit log settings
 ENV_AUDIT_LOG_ENABLED = "HINDSIGHT_API_AUDIT_LOG_ENABLED"
 ENV_AUDIT_LOG_ACTIONS = "HINDSIGHT_API_AUDIT_LOG_ACTIONS"
@@ -566,6 +606,7 @@ ENV_LLM_TRACE_MAX_CHARS = "HINDSIGHT_API_LLM_TRACE_MAX_CHARS"
 
 # Background maintenance settings
 ENV_CONSOLIDATION_RECONCILE_INTERVAL_SECONDS = "HINDSIGHT_API_CONSOLIDATION_RECONCILE_INTERVAL_SECONDS"
+ENV_MENTAL_MODEL_REFRESH_TICK_SECONDS = "HINDSIGHT_API_MENTAL_MODEL_REFRESH_TICK_SECONDS"
 
 # Disposition settings
 ENV_DISPOSITION_SKEPTICISM = "HINDSIGHT_API_DISPOSITION_SKEPTICISM"
@@ -588,6 +629,7 @@ PROVIDER_DEFAULT_MODELS = {
     "deepseek": "deepseek-v4-flash",
     "zai": "glm-4.5-flash",
     "opencode-go": "deepseek-v4-flash",
+    "atlas": "deepseek-ai/deepseek-v4-pro",
     "ollama": "gemma3:12b",
     "ollama-cloud": "gemma3:12b",
     "llamacpp": "gemma-4-e2b-it",
@@ -691,6 +733,14 @@ DEFAULT_RECALL_MAX_CANDIDATES_PER_SOURCE = 0
 # "graph:high,semantic:low"). Empty disables the feature. See
 # ENV_RECALL_STRATEGY_BOOSTS for the full rationale.
 DEFAULT_RECALL_STRATEGY_BOOSTS = ""
+# Recency decay shape used by recall reranking. "linear" reproduces the
+# historical straight-line decay; defaults below keep behaviour unchanged.
+RECENCY_DECAY_FUNCTIONS = ("linear", "exponential", "none")
+DEFAULT_RECENCY_DECAY_FUNCTION = "linear"
+# Linear: days over which freshness decays from 1.0 to its 0.1 floor.
+DEFAULT_RECENCY_DECAY_LINEAR_WINDOW_DAYS = 365.0
+# Exponential: age (days) at which the recency signal is neutral (0.5).
+DEFAULT_RECENCY_DECAY_HALFLIFE_DAYS = 90.0
 # Retrieval arms that can be boosted; mirrors fusion.py source_names.
 RECALL_STRATEGY_NAMES = ("semantic", "bm25", "graph", "temporal")
 # User-facing priority levels. Kept in sync with recall_boost.BOOST_LEVELS by a
@@ -804,6 +854,7 @@ DEFAULT_ACCESS_LOG = False
 DEFAULT_MCP_ENABLED = True
 DEFAULT_MCP_ENABLED_TOOLS: list[str] | None = None  # None = all tools enabled
 DEFAULT_MCP_STATELESS = False  # False = stateful (supports SSE/GET); True = stateless (POST-only)
+DEFAULT_MCP_INSTRUCTIONS = None
 DEFAULT_ENABLE_BANK_CONFIG_API = True
 # Dry-run extraction is a preview tool that makes a real LLM call but stores nothing. Enabled by
 # default; set HINDSIGHT_API_ENABLE_DRY_RUN_EXTRACT=false to remove the endpoint (e.g. to cap
@@ -847,6 +898,10 @@ DEFAULT_RETAIN_BATCH_POLL_INTERVAL_SECONDS = 60  # Batch API polling interval in
 DEFAULT_FILE_STORAGE_TYPE = "native"  # PostgreSQL BYTEA storage
 DEFAULT_FILE_PARSER = "markitdown"  # Default parser fallback chain (comma-separated, e.g. "iris,markitdown")
 DEFAULT_FILE_PARSER_ALLOWLIST = None  # Allowlist of parsers clients may request (None = all registered parsers)
+DEFAULT_FILE_PARSER_MARKITDOWN_OCR_ENABLED = False
+DEFAULT_FILE_PARSER_MARKITDOWN_OCR_PROMPT = """You are a precise OCR transcription engine.
+
+Transcribe only the visible text in the image. Do not describe the image, summarize it, translate it, infer missing content, or add commentary. Preserve the original language, wording, numbers, punctuation, capitalization, and reading order. Reconstruct headings, lists, key-value fields, stamps, and tables as clean Markdown when the layout is clear. If text is unreadable or uncertain, write [unclear] for that span. Return only the extracted Markdown."""
 DEFAULT_FILE_CONVERSION_MAX_BATCH_SIZE_MB = 100  # Max total batch size in MB (all files combined)
 DEFAULT_FILE_CONVERSION_MAX_BATCH_SIZE = 10  # Max files per batch upload
 DEFAULT_ENABLE_FILE_UPLOAD_API = True  # Enable file upload endpoint
@@ -965,6 +1020,7 @@ DEFAULT_OTEL_TRACES_ENABLED = False  # Disabled by default for backward compatib
 DEFAULT_OTEL_SERVICE_NAME = "hindsight-api"
 DEFAULT_OTEL_DEPLOYMENT_ENVIRONMENT = "development"
 DEFAULT_METRICS_INCLUDE_BANK_ID = False  # Disabled by default to avoid high-cardinality OTel metric growth
+DEFAULT_METRICS_BACKLOG_ENABLED = False  # Disabled by default: runs periodic per-schema COUNT queries
 
 # Audit log defaults
 DEFAULT_AUDIT_LOG_ENABLED = False  # Disabled by default
@@ -982,6 +1038,11 @@ DEFAULT_LLM_TRACE_MAX_CHARS = 50000  # Truncate stored input/output beyond this 
 # facts (e.g. after a consolidation operation failed terminally and left them unscheduled).
 # 0 disables the reconcile sweep.
 DEFAULT_CONSOLIDATION_RECONCILE_INTERVAL_SECONDS = 300
+
+# How often the maintenance loop checks for cron-scheduled mental models that are
+# due for a refresh. This is the *check* cadence; the actual schedule is the
+# per-model cron expression in the mental model's trigger. 0 disables the sweep.
+DEFAULT_MENTAL_MODEL_REFRESH_TICK_SECONDS = 60
 
 # Default MCP tool descriptions (can be customized via env vars)
 DEFAULT_MCP_RETAIN_DESCRIPTION = """Store important information to long-term memory.
@@ -1180,6 +1241,18 @@ def _validate_recall_budget_function(function: str) -> str:
     return function_lower
 
 
+def _validate_recency_decay_function(function: str) -> str:
+    """Validate and normalize the recency decay function."""
+    function_lower = function.lower()
+    if function_lower not in RECENCY_DECAY_FUNCTIONS:
+        logger.warning(
+            f"Invalid recency decay function '{function}', must be one of {RECENCY_DECAY_FUNCTIONS}. "
+            f"Defaulting to '{DEFAULT_RECENCY_DECAY_FUNCTION}'."
+        )
+        return DEFAULT_RECENCY_DECAY_FUNCTION
+    return function_lower
+
+
 def _parse_bank_priority(raw: str) -> dict[str, int]:
     """Parse ``bank-pattern:priority,...`` into ``{pattern: priority}``.
 
@@ -1233,6 +1306,132 @@ def _parse_llm_router_config(env_var: str) -> dict | None:
         return json.loads(raw)
     except json.JSONDecodeError as e:
         raise ValueError(f"Invalid {env_var}: invalid JSON: {e}") from e
+
+
+@dataclass
+class LLMMemberConfig:
+    """One extra LLM in a multi-LLM chain, configured via indexed env vars.
+
+    Mirrors the subset of LLM settings an indexed member supports
+    (``HINDSIGHT_API_<OP>LLM_<n>_*``). The unindexed config remains the primary
+    member (index 0); these describe members 1..N.
+    """
+
+    provider: str
+    api_key: str | None
+    model: str
+    base_url: str | None
+    reasoning_effort: str | None
+    extra_body: dict | None
+    default_headers: dict | None
+    bedrock_service_tier: str | None
+    gemini_service_tier: str | None
+    vertexai_project_id: str | None = None
+    vertexai_region: str | None = None
+    vertexai_service_account_key: str | None = None
+    litellmrouter_config: dict | None = None
+
+
+# Valid multi-LLM strategy modes.
+LLM_STRATEGY_FAILOVER = "failover"
+LLM_STRATEGY_ROUND_ROBIN = "round-robin"
+_VALID_LLM_STRATEGY_MODES = (LLM_STRATEGY_FAILOVER, LLM_STRATEGY_ROUND_ROBIN)
+
+
+@dataclass
+class LLMStrategyConfig:
+    """How to route a request across the members of a multi-LLM chain.
+
+    ``mode`` is "failover" (try members in order) or "round-robin" (rotate the
+    starting member per request, then fall through the rest on error). ``weights``
+    is round-robin only: positive integers, one per member (primary first), giving
+    an unbalanced rotation; ``None`` means uniform.
+    """
+
+    mode: str
+    weights: list[int] | None = None
+
+
+def _parse_llm_strategy(raw: str | None) -> LLMStrategyConfig | None:
+    """Parse a multi-LLM strategy from a JSON env var.
+
+    Returns ``None`` when unset. The value must be a JSON object with a ``mode``
+    of "failover" or "round-robin"; ``weights`` (round-robin only) must be a list
+    of positive ints. Raises ``ValueError`` on any malformed input so
+    misconfiguration fails fast at startup rather than silently degrading.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid {ENV_LLM_STRATEGY}: invalid JSON: {e}") from e
+    if not isinstance(parsed, dict):
+        raise ValueError(f"Invalid LLM strategy: expected a JSON object, got {type(parsed).__name__}")
+
+    mode = parsed.get("mode")
+    if mode not in _VALID_LLM_STRATEGY_MODES:
+        raise ValueError(f"Invalid LLM strategy mode {mode!r}. Must be one of: {', '.join(_VALID_LLM_STRATEGY_MODES)}.")
+
+    weights = parsed.get("weights")
+    if weights is not None:
+        if mode != LLM_STRATEGY_ROUND_ROBIN:
+            raise ValueError(f"LLM strategy 'weights' is only valid with mode '{LLM_STRATEGY_ROUND_ROBIN}'.")
+        if not isinstance(weights, list) or not weights or not all(isinstance(w, int) and w > 0 for w in weights):
+            raise ValueError("LLM strategy 'weights' must be a non-empty list of positive integers.")
+
+    return LLMStrategyConfig(mode=mode, weights=weights)
+
+
+def _parse_llm_members(prefix: str) -> list[LLMMemberConfig]:
+    """Parse indexed extra-LLM members for an operation env prefix.
+
+    ``prefix`` is the operation segment in the env name: ``""`` (global),
+    ``"RETAIN_"``, ``"REFLECT_"`` or ``"CONSOLIDATION_"``. Members are read from
+    ``HINDSIGHT_API_{prefix}LLM_{n}_PROVIDER`` for n = 1, 2, ... and scanning
+    stops at the first index whose ``_PROVIDER`` is unset (so indices must be
+    contiguous from 1). ``MODEL`` defaults to the provider's default model.
+    """
+    from .engine.llm_wrapper import requires_api_key
+
+    members: list[LLMMemberConfig] = []
+    index = 1
+    while True:
+        base = f"HINDSIGHT_API_{prefix}LLM_{index}_"
+        provider = os.getenv(base + "PROVIDER")
+        if not provider:
+            break
+
+        api_key = os.getenv(base + "API_KEY") or None
+        if not api_key and requires_api_key(provider):
+            raise ValueError(
+                f"{base}API_KEY is required for provider '{provider}' (member {index} of the multi-LLM chain)."
+            )
+
+        gemini_service_tier = os.getenv(base + "GEMINI_SERVICE_TIER")
+        members.append(
+            LLMMemberConfig(
+                provider=provider,
+                api_key=api_key,
+                model=os.getenv(base + "MODEL") or _get_default_model_for_provider(provider),
+                base_url=os.getenv(base + "BASE_URL") or None,
+                reasoning_effort=os.getenv(base + "REASONING_EFFORT") or None,
+                extra_body=json.loads(os.getenv(base + "EXTRA_BODY", "null")),
+                default_headers=json.loads(os.getenv(base + "DEFAULT_HEADERS", "null")),
+                bedrock_service_tier=os.getenv(base + "BEDROCK_SERVICE_TIER") or None,
+                gemini_service_tier=(
+                    parse_gemini_service_tier(gemini_service_tier) if provider.lower() == "gemini" else None
+                ),
+                vertexai_project_id=os.getenv(base + "VERTEXAI_PROJECT_ID") or None,
+                vertexai_region=os.getenv(base + "VERTEXAI_REGION") or None,
+                vertexai_service_account_key=os.getenv(base + "VERTEXAI_SERVICE_ACCOUNT_KEY") or None,
+                litellmrouter_config=_parse_llm_router_config(base + "LITELLMROUTER_CONFIG"),
+            )
+        )
+        index += 1
+
+    return members
 
 
 def _parse_default_bank_template(raw: str | None) -> dict | None:
@@ -1298,6 +1497,7 @@ class HindsightConfig:
     llm_groq_service_tier: str  # Groq: "on_demand", "flex", or "auto"
     llm_openai_service_tier: str | None  # OpenAI: None (default) or "flex" (50% cheaper)
     llm_bedrock_service_tier: str | None  # Bedrock: None (default), "flex", "priority", or "reserved"
+    llm_gemini_service_tier: str | None  # Gemini: None (default) or "flex" (50% cheaper)
     llm_extra_body: (
         dict | None
     )  # Extra body params merged into OpenAI-compatible API calls (e.g. {"chat_template_kwargs": {"enable_thinking": true}})
@@ -1435,6 +1635,9 @@ class HindsightConfig:
     bm25_min_score: float
     recall_max_candidates_per_source: int
     recall_strategy_boosts: dict[str, str]
+    recency_decay_function: str
+    recency_decay_linear_window_days: float
+    recency_decay_halflife_days: float
     reranker_cohere_api_key: str | None
     reranker_cohere_model: str
     reranker_cohere_base_url: str | None
@@ -1478,6 +1681,7 @@ class HindsightConfig:
     mcp_enabled: bool
     mcp_enabled_tools: list[str] | None  # None = all tools; explicit list = allowlist
     mcp_stateless: bool  # True = stateless HTTP (POST-only); False = stateful (supports GET/SSE)
+    mcp_instructions: str | None  # Additional instructions appended to retain/recall MCP tool descriptions
     enable_bank_config_api: bool
     enable_bank_llm_health: bool
     enable_dry_run_extract: bool
@@ -1642,6 +1846,7 @@ class HindsightConfig:
     otel_service_name: str
     otel_deployment_environment: str
     metrics_include_bank_id: bool
+    metrics_backlog_enabled: bool
 
     # Audit log configuration (static - server-level only)
     audit_log_enabled: bool  # Master switch for audit logging
@@ -1658,6 +1863,9 @@ class HindsightConfig:
     # Interval for the periodic sweep that re-schedules consolidation for banks with
     # eligible-but-unscheduled facts. 0 = disabled.
     consolidation_reconcile_interval_seconds: int
+    # How often the maintenance loop checks for cron-scheduled mental models due for
+    # refresh (the per-model schedule lives in the mental model trigger). 0 = disabled.
+    mental_model_refresh_tick_seconds: int
 
     # Webhook configuration (static - server-level only, not per-bank)
     webhook_url: str | None  # Global webhook URL (None = disabled)
@@ -1676,6 +1884,25 @@ class HindsightConfig:
     embeddings_zeroentropy_encoding_format: str = DEFAULT_EMBEDDINGS_ZEROENTROPY_ENCODING_FORMAT
     embeddings_zeroentropy_batch_size: int = DEFAULT_EMBEDDINGS_ZEROENTROPY_BATCH_SIZE
     embeddings_zeroentropy_latency: str | None = DEFAULT_EMBEDDINGS_ZEROENTROPY_LATENCY
+    file_parser_markitdown_ocr_enabled: bool = DEFAULT_FILE_PARSER_MARKITDOWN_OCR_ENABLED
+    file_parser_markitdown_ocr_api_key: str | None = None
+    file_parser_markitdown_ocr_base_url: str | None = None
+    file_parser_markitdown_ocr_model: str | None = None
+    file_parser_markitdown_ocr_prompt: str = DEFAULT_FILE_PARSER_MARKITDOWN_OCR_PROMPT
+
+    # Multi-LLM chains (static, server-level). Index 0 of each chain is the
+    # corresponding unindexed/base LLM config above; these hold the extra indexed
+    # members and the routing strategy. Per-op members fall back to the global
+    # members when unset (see MemoryEngine._build_llm). Credential fields (members
+    # embed api_keys/base_urls).
+    llm_members: list[LLMMemberConfig] = field(default_factory=list)
+    llm_strategy: LLMStrategyConfig | None = None
+    retain_llm_members: list[LLMMemberConfig] = field(default_factory=list)
+    retain_llm_strategy: LLMStrategyConfig | None = None
+    reflect_llm_members: list[LLMMemberConfig] = field(default_factory=list)
+    reflect_llm_strategy: LLMStrategyConfig | None = None
+    consolidation_llm_members: list[LLMMemberConfig] = field(default_factory=list)
+    consolidation_llm_strategy: LLMStrategyConfig | None = None
 
     # Class-level sets for configuration categorization
 
@@ -1691,6 +1918,11 @@ class HindsightConfig:
         "retain_llm_litellmrouter_config",
         "reflect_llm_litellmrouter_config",
         "consolidation_llm_litellmrouter_config",
+        # Multi-LLM chains — members embed api_keys and base_urls
+        "llm_members",
+        "retain_llm_members",
+        "reflect_llm_members",
+        "consolidation_llm_members",
         # Base URLs (could expose infrastructure)
         "llm_base_url",
         "retain_llm_base_url",
@@ -1716,6 +1948,8 @@ class HindsightConfig:
         "file_storage_gcs_service_account_key",
         "file_storage_azure_account_key",
         # File parser credentials
+        "file_parser_markitdown_ocr_api_key",
+        "file_parser_markitdown_ocr_base_url",
         "file_parser_iris_token",
         "file_parser_llama_parse_api_key",
     }
@@ -1879,6 +2113,9 @@ class HindsightConfig:
                 f"Note: 'standard' is not a valid Bedrock service tier -- use unset for default tier."
             )
 
+        # Validate gemini_service_tier
+        self.llm_gemini_service_tier = parse_gemini_service_tier(self.llm_gemini_service_tier)
+
         # When LLM provider is "none", force chunks-only mode and disable LLM-dependent features
         if self.llm_provider == "none":
             self.retain_extraction_mode = "chunks"
@@ -1996,6 +2233,11 @@ class HindsightConfig:
             llm_groq_service_tier=os.getenv(ENV_LLM_GROQ_SERVICE_TIER, DEFAULT_LLM_GROQ_SERVICE_TIER),
             llm_openai_service_tier=os.getenv(ENV_LLM_OPENAI_SERVICE_TIER, DEFAULT_LLM_OPENAI_SERVICE_TIER),
             llm_bedrock_service_tier=os.getenv(ENV_LLM_BEDROCK_SERVICE_TIER) or None,
+            llm_gemini_service_tier=(
+                parse_gemini_service_tier(os.getenv(ENV_LLM_GEMINI_SERVICE_TIER) or DEFAULT_LLM_GEMINI_SERVICE_TIER)
+                if llm_provider.lower() == "gemini"
+                else None
+            ),
             llm_extra_body=json.loads(os.getenv(ENV_LLM_EXTRA_BODY, "null")),
             llm_default_headers=json.loads(os.getenv(ENV_LLM_DEFAULT_HEADERS, "null")),
             llm_strict_schema=os.getenv(ENV_LLM_STRICT_SCHEMA, str(DEFAULT_LLM_STRICT_SCHEMA)).lower() in ("true", "1"),
@@ -2100,6 +2342,15 @@ class HindsightConfig:
             if os.getenv(ENV_CONSOLIDATION_LLM_TIMEOUT)
             else None,
             consolidation_llm_litellmrouter_config=_parse_llm_router_config(ENV_CONSOLIDATION_LLM_LITELLMROUTER_CONFIG),
+            # Multi-LLM chains (indexed members + routing strategy)
+            llm_members=_parse_llm_members(""),
+            llm_strategy=_parse_llm_strategy(os.getenv(ENV_LLM_STRATEGY)),
+            retain_llm_members=_parse_llm_members("RETAIN_"),
+            retain_llm_strategy=_parse_llm_strategy(os.getenv(ENV_RETAIN_LLM_STRATEGY)),
+            reflect_llm_members=_parse_llm_members("REFLECT_"),
+            reflect_llm_strategy=_parse_llm_strategy(os.getenv(ENV_REFLECT_LLM_STRATEGY)),
+            consolidation_llm_members=_parse_llm_members("CONSOLIDATION_"),
+            consolidation_llm_strategy=_parse_llm_strategy(os.getenv(ENV_CONSOLIDATION_LLM_STRATEGY)),
             # Embeddings
             embeddings_provider=os.getenv(ENV_EMBEDDINGS_PROVIDER, DEFAULT_EMBEDDINGS_PROVIDER),
             embeddings_local_model=os.getenv(ENV_EMBEDDINGS_LOCAL_MODEL, DEFAULT_EMBEDDINGS_LOCAL_MODEL),
@@ -2270,6 +2521,15 @@ class HindsightConfig:
             recall_strategy_boosts=_parse_strategy_boosts(
                 os.getenv(ENV_RECALL_STRATEGY_BOOSTS, DEFAULT_RECALL_STRATEGY_BOOSTS)
             ),
+            recency_decay_function=_validate_recency_decay_function(
+                os.getenv(ENV_RECENCY_DECAY_FUNCTION, DEFAULT_RECENCY_DECAY_FUNCTION)
+            ),
+            recency_decay_linear_window_days=float(
+                os.getenv(ENV_RECENCY_DECAY_LINEAR_WINDOW_DAYS, str(DEFAULT_RECENCY_DECAY_LINEAR_WINDOW_DAYS))
+            ),
+            recency_decay_halflife_days=float(
+                os.getenv(ENV_RECENCY_DECAY_HALFLIFE_DAYS, str(DEFAULT_RECENCY_DECAY_HALFLIFE_DAYS))
+            ),
             # Cohere reranker (with backward-compatible fallback to shared API key)
             reranker_cohere_api_key=os.getenv(ENV_RERANKER_COHERE_API_KEY) or os.getenv(ENV_COHERE_API_KEY),
             reranker_cohere_model=os.getenv(ENV_RERANKER_COHERE_MODEL, DEFAULT_RERANKER_COHERE_MODEL),
@@ -2345,6 +2605,7 @@ class HindsightConfig:
             if os.getenv(ENV_MCP_ENABLED_TOOLS)
             else DEFAULT_MCP_ENABLED_TOOLS,
             mcp_stateless=os.getenv(ENV_MCP_STATELESS, str(DEFAULT_MCP_STATELESS)).lower() == "true",
+            mcp_instructions=os.getenv(ENV_MCP_INSTRUCTIONS) or DEFAULT_MCP_INSTRUCTIONS,
             enable_bank_llm_health=os.getenv(ENV_ENABLE_BANK_LLM_HEALTH, str(DEFAULT_ENABLE_BANK_LLM_HEALTH)).lower()
             == "true",
             enable_bank_config_api=os.getenv(ENV_ENABLE_BANK_CONFIG_API, str(DEFAULT_ENABLE_BANK_CONFIG_API)).lower()
@@ -2424,6 +2685,18 @@ class HindsightConfig:
             file_parser_allowlist=_parse_str_list(os.getenv(ENV_FILE_PARSER_ALLOWLIST))
             if os.getenv(ENV_FILE_PARSER_ALLOWLIST)
             else None,
+            file_parser_markitdown_ocr_enabled=os.getenv(
+                ENV_FILE_PARSER_MARKITDOWN_OCR_ENABLED,
+                str(DEFAULT_FILE_PARSER_MARKITDOWN_OCR_ENABLED),
+            ).lower()
+            in ("1", "true", "yes", "on"),
+            file_parser_markitdown_ocr_api_key=os.getenv(ENV_FILE_PARSER_MARKITDOWN_OCR_API_KEY) or None,
+            file_parser_markitdown_ocr_base_url=os.getenv(ENV_FILE_PARSER_MARKITDOWN_OCR_BASE_URL) or None,
+            file_parser_markitdown_ocr_model=os.getenv(ENV_FILE_PARSER_MARKITDOWN_OCR_MODEL) or None,
+            file_parser_markitdown_ocr_prompt=os.getenv(
+                ENV_FILE_PARSER_MARKITDOWN_OCR_PROMPT,
+                DEFAULT_FILE_PARSER_MARKITDOWN_OCR_PROMPT,
+            ),
             file_parser_iris_token=os.getenv(ENV_FILE_PARSER_IRIS_TOKEN) or None,
             file_parser_iris_org_id=os.getenv(ENV_FILE_PARSER_IRIS_ORG_ID) or None,
             file_parser_llama_parse_api_key=os.getenv(ENV_FILE_PARSER_LLAMA_PARSE_API_KEY) or None,
@@ -2614,6 +2887,8 @@ class HindsightConfig:
             otel_deployment_environment=os.getenv(ENV_OTEL_DEPLOYMENT_ENVIRONMENT, DEFAULT_OTEL_DEPLOYMENT_ENVIRONMENT),
             metrics_include_bank_id=os.getenv(ENV_METRICS_INCLUDE_BANK_ID, str(DEFAULT_METRICS_INCLUDE_BANK_ID)).lower()
             in ("true", "1", "yes"),
+            metrics_backlog_enabled=os.getenv(ENV_METRICS_BACKLOG_ENABLED, str(DEFAULT_METRICS_BACKLOG_ENABLED)).lower()
+            in ("true", "1", "yes"),
             # Audit log configuration (static, server-level only)
             audit_log_enabled=os.getenv(ENV_AUDIT_LOG_ENABLED, str(DEFAULT_AUDIT_LOG_ENABLED)).lower() == "true",
             audit_log_actions=[
@@ -2636,6 +2911,12 @@ class HindsightConfig:
                 os.getenv(
                     ENV_CONSOLIDATION_RECONCILE_INTERVAL_SECONDS,
                     str(DEFAULT_CONSOLIDATION_RECONCILE_INTERVAL_SECONDS),
+                )
+            ),
+            mental_model_refresh_tick_seconds=int(
+                os.getenv(
+                    ENV_MENTAL_MODEL_REFRESH_TICK_SECONDS,
+                    str(DEFAULT_MENTAL_MODEL_REFRESH_TICK_SECONDS),
                 )
             ),
             # Webhook configuration (static, server-level only)

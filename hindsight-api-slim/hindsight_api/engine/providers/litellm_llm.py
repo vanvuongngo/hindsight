@@ -15,15 +15,36 @@ is handled automatically by LiteLLM.
 import asyncio
 import json
 import logging
+import os
 import time
 from typing import Any
 
+from litellm.exceptions import Timeout as LiteLLMTimeout
+
+from hindsight_api.config import DEFAULT_LLM_TIMEOUT, ENV_LLM_TIMEOUT
 from hindsight_api.engine.llm_interface import LLMInterface, OutputTooLongError
+from hindsight_api.engine.llm_trace import LLMResponseUsage, stash_response_usage
 from hindsight_api.engine.response_models import LLMToolCall, LLMToolCallResult, TokenUsage
 from hindsight_api.metrics import get_metrics_collector
 from hindsight_api.worker.stage import set_stage
 
 logger = logging.getLogger(__name__)
+
+
+def _usage_from_litellm_response(response: Any) -> LLMResponseUsage:
+    """Extract prompt/completion/cached token counts from a LiteLLM (OpenAI-shaped) usage block."""
+    usage = getattr(response, "usage", None)
+    if not usage:
+        return LLMResponseUsage()
+    cached_tokens = 0
+    details = getattr(usage, "prompt_tokens_details", None)
+    if details:
+        cached_tokens = getattr(details, "cached_tokens", 0) or 0
+    return LLMResponseUsage(
+        input_tokens=getattr(usage, "prompt_tokens", 0) or 0,
+        output_tokens=getattr(usage, "completion_tokens", 0) or 0,
+        cached_tokens=cached_tokens,
+    )
 
 
 class LiteLLMLLM(LLMInterface):
@@ -47,13 +68,15 @@ class LiteLLMLLM(LLMInterface):
         base_url: str,
         model: str,
         reasoning_effort: str = "low",
-        timeout: float = 300.0,
+        timeout: float | None = None,
         extra_body: dict[str, Any] | None = None,
         bedrock_service_tier: str | None = None,
         **kwargs: Any,
     ):
         super().__init__(provider, api_key, base_url, model, reasoning_effort, **kwargs)
-        self.timeout = timeout
+        # ``None`` falls back to HINDSIGHT_API_LLM_TIMEOUT, then DEFAULT_LLM_TIMEOUT — never None,
+        # so the hard ``asyncio.wait_for`` backstop in ``call`` is always bounded.
+        self.timeout = timeout if timeout is not None else float(os.getenv(ENV_LLM_TIMEOUT, str(DEFAULT_LLM_TIMEOUT)))
         self._litellm: Any = None
         # User-configured extra params merged as top-level kwargs into every
         # completion call so LiteLLM normalizes them per-provider (e.g. maps
@@ -209,7 +232,14 @@ class LiteLLMLLM(LLMInterface):
             if attempt > 0:
                 set_stage(f"llm.{self._stage_label}.{scope}.attempt={attempt + 1}/{max_retries + 1}")
             try:
-                response = await self._acompletion(**call_kwargs)
+                response = await asyncio.wait_for(
+                    self._acompletion(**call_kwargs),
+                    timeout=self.timeout,
+                )
+                # Stash usage before the length check and parse/validate below,
+                # which may raise locally even though the provider charged for
+                # these tokens (#2387).
+                stash_response_usage(_usage_from_litellm_response(response))
 
                 content = response.choices[0].message.content or ""
                 finish_reason = response.choices[0].finish_reason
@@ -240,8 +270,9 @@ class LiteLLMLLM(LLMInterface):
                     result = content
 
                 # Extract usage
-                input_tokens = getattr(response.usage, "prompt_tokens", 0) or 0
-                output_tokens = getattr(response.usage, "completion_tokens", 0) or 0
+                response_usage = _usage_from_litellm_response(response)
+                input_tokens = response_usage.input_tokens
+                output_tokens = response_usage.output_tokens
                 total_tokens = input_tokens + output_tokens
 
                 # Record metrics
@@ -304,6 +335,25 @@ class LiteLLMLLM(LLMInterface):
                     logger.error(f"LiteLLM returned invalid JSON after {max_retries + 1} attempts")
                     raise
 
+            except (TimeoutError, asyncio.TimeoutError, LiteLLMTimeout) as e:
+                # litellm/httpx don't always honor their own ``timeout=`` (e.g. a connection held
+                # open with no token progress), so ``wait_for`` is the hard cap that cancels a hung
+                # call regardless — otherwise one straggler pins a worker slot and stalls its gather.
+                last_exception = e
+                exc_name = type(e).__name__
+                if attempt < max_retries:
+                    logger.warning(
+                        f"LiteLLM call exceeded timeout={self.timeout}s ({exc_name}, scope={scope}), retrying..."
+                    )
+                    backoff = min(initial_backoff * (2**attempt), max_backoff)
+                    await asyncio.sleep(backoff)
+                    continue
+                logger.error(
+                    f"LiteLLM call timed out after {self.timeout}s on {attempt + 1} attempts "
+                    f"({exc_name}, scope={scope})"
+                )
+                raise
+
             except Exception as e:
                 error_str = str(e).lower()
                 # Fast fail on auth errors
@@ -354,7 +404,10 @@ class LiteLLMLLM(LLMInterface):
             if attempt > 0:
                 set_stage(f"llm.{self._stage_label}.tools.attempt={attempt + 1}/{max_retries + 1}")
             try:
-                response = await self._acompletion(**call_kwargs)
+                response = await asyncio.wait_for(
+                    self._acompletion(**call_kwargs),
+                    timeout=self.timeout,
+                )
 
                 message = response.choices[0].message
                 content = message.content
@@ -423,6 +476,23 @@ class LiteLLMLLM(LLMInterface):
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
                 )
+
+            except (TimeoutError, asyncio.TimeoutError, LiteLLMTimeout) as e:
+                # See ``call`` — hard cap so a hung completion cannot block
+                # forever and pin a worker slot / concurrency permit.
+                last_exception = e
+                exc_name = type(e).__name__
+                if attempt < max_retries:
+                    logger.warning(
+                        f"LiteLLM tool call exceeded timeout={self.timeout}s ({exc_name}, scope={scope}), retrying..."
+                    )
+                    await asyncio.sleep(min(initial_backoff * (2**attempt), max_backoff))
+                    continue
+                logger.error(
+                    f"LiteLLM tool call timed out after {self.timeout}s on {attempt + 1} attempts "
+                    f"({exc_name}, scope={scope})"
+                )
+                raise
 
             except Exception as e:
                 error_str = str(e).lower()

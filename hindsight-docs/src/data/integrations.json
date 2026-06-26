@@ -21,6 +21,16 @@
       "icon": "/img/icons/agent-framework.svg"
     },
     {
+      "id": "composio",
+      "name": "Composio",
+      "description": "Hindsight memory as Composio custom tools. Retain, recall, and reflect drop into any Composio agent — memory is isolated per session user automatically.",
+      "type": "official",
+      "by": "hindsight",
+      "category": "framework",
+      "link": "/sdks/integrations/composio",
+      "icon": "/img/icons/composio.png"
+    },
+    {
       "id": "crewai",
       "name": "CrewAI",
       "description": "Give CrewAI agents persistent, cross-session memory. Facts learned in one run are available in every future run.",
@@ -78,6 +88,16 @@
       "by": "hermes",
       "category": "framework",
       "link": "/sdks/integrations/hermes",
+      "icon": "/img/icons/hermes.png"
+    },
+    {
+      "id": "hermes-desktop",
+      "name": "Hermes Desktop",
+      "description": "Configure Hindsight as your memory provider directly in the Hermes desktop app — pick a mode, paste an API key, no config files.",
+      "type": "native",
+      "by": "hermes",
+      "category": "tool",
+      "link": "/sdks/integrations/hermes-desktop",
       "icon": "/img/icons/hermes.png"
     },
     {
@@ -151,6 +171,16 @@
       "icon": "/img/icons/codex.svg"
     },
     {
+      "id": "github-copilot",
+      "name": "GitHub Copilot",
+      "description": "Long-term memory for GitHub Copilot in VS Code. One command wires the Hindsight MCP server into .vscode/mcp.json plus a recall/retain rule in .github/copilot-instructions.md.",
+      "type": "official",
+      "by": "hindsight",
+      "category": "tool",
+      "link": "/sdks/integrations/github-copilot",
+      "icon": "/img/icons/github-copilot.svg"
+    },
+    {
       "id": "continue",
       "name": "Continue",
       "description": "Long-term memory for the Continue.dev coding assistant. Recall relevant project memory into chat with @hindsight, plus optional automatic recall/retain via the Hindsight MCP server.",
@@ -169,6 +199,16 @@
       "category": "tool",
       "link": "/sdks/integrations/cursor",
       "icon": "/img/icons/cursor.svg"
+    },
+    {
+      "id": "zed",
+      "name": "Zed",
+      "description": "Long-term memory for the Zed editor's AI assistant via the Hindsight MCP server. One command wires up the MCP context server plus a recall/retain rule, so memory works automatically in the Agent Panel.",
+      "type": "official",
+      "by": "hindsight",
+      "category": "tool",
+      "link": "/sdks/integrations/zed",
+      "icon": "/img/icons/zed.svg"
     },
     {
       "id": "cline",
@@ -311,6 +351,16 @@
       "icon": "/img/icons/autogen.png"
     },
     {
+      "id": "aider",
+      "name": "Aider",
+      "description": "Persistent long-term memory for the Aider pair-programming CLI. hindsight-aider recalls relevant project memory before each session and retains the transcript after.",
+      "type": "official",
+      "by": "hindsight",
+      "category": "tool",
+      "link": "/sdks/integrations/aider",
+      "icon": "/img/icons/aider.png"
+    },
+    {
       "id": "opencode",
       "name": "OpenCode",
       "description": "Persistent long-term memory plugin for OpenCode. Auto-retains conversations, recalls context on session start, and provides retain/recall/reflect tools.",
@@ -319,6 +369,16 @@
       "category": "tool",
       "link": "/sdks/integrations/opencode",
       "icon": "/img/icons/opencode.png"
+    },
+    {
+      "id": "eve",
+      "name": "Eve",
+      "description": "Long-term memory for Vercel Eve agents. A one-line MCP connection exposing retain, recall, and reflect.",
+      "type": "official",
+      "by": "hindsight",
+      "category": "framework",
+      "link": "/sdks/integrations/eve",
+      "icon": "/img/icons/eve.svg"
     },
     {
       "id": "n8n",
@@ -489,6 +549,46 @@
       "category": "framework",
       "link": "https://www.outsystems.com/forge/component-overview/24766/hindsight-api-odc",
       "icon": "/img/icons/outsystems.png"
-    }
+    },
+    {
+      "id": "agrasandhany",
+      "name": "agrasandhany",
+      "description": "Turns your local notes into long-term memory any agent can recall over MCP — with automatic sync, folder-scoped recall, and living summaries.",
+      "type": "community",
+      "by": "yugandhar-maram",
+      "category": "tool",
+      "link": "https://github.com/yugandhar-maram/agrasandhany",
+      "icon": "/img/icons/github.png"
+    },
+    {
+      "id": "openhands",
+      "name": "OpenHands",
+      "description": "Long-term memory for OpenHands (formerly OpenDevin) via its native MCP support. One command wires the Hindsight MCP server into config.toml plus a recall/retain rule.",
+      "type": "official",
+      "by": "hindsight",
+      "category": "tool",
+      "link": "/sdks/integrations/openhands",
+      "icon": "/img/icons/openhands.png"
+    },
+    {
+      "id": "windsurf",
+      "name": "Windsurf",
+      "description": "Long-term memory for Windsurf (Codeium) via its native MCP support. One command wires the Hindsight MCP server into mcp_config.json plus an always-on recall/retain rule, so memory works automatically in Cascade.",
+      "type": "official",
+      "by": "hindsight",
+      "category": "tool",
+      "link": "/sdks/integrations/windsurf",
+      "icon": "/img/icons/windsurf.svg"
+    },
+    {
+     "id": "epimetheus",
+     "name": "Epimetheus",
+     "description": "Memory for pi coding agent. Retain, recall, reflect, past-session ingestion, and much more, with a focus on flexibility and memory quality/best practices.",
+     "type": "community",
+     "by": "noctuid",
+     "category": "tool",
+     "link": "https://github.com/noctuid/epimetheus",
+     "icon": "/img/icons/epimetheus.png"
+   }
   ]
 }

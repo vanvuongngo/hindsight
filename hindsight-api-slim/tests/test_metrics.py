@@ -11,6 +11,7 @@ from hindsight_api.metrics import (
     get_token_bucket,
     create_metrics_collector,
     initialize_metrics,
+    normalize_http_endpoint,
 )
 
 
@@ -221,6 +222,17 @@ class TestMetricsCollector:
         assert reflect_attrs["operation"] == "reflect"
         assert reflect_attrs["source"] == "api"
 
+    def test_record_operation_result_records_with_explicit_success(self, collector):
+        """Direct recording path used by the worker (source=worker, explicit success)."""
+        collector.record_operation_result("retain", bank_id="test_bank", success=False, duration=1.5, source="worker")
+
+        duration, attributes = collector.operation_duration.record.call_args[0]
+        assert duration == 1.5
+        assert attributes["operation"] == "retain"
+        assert attributes["source"] == "worker"
+        assert attributes["success"] == "false"
+        collector.operation_total.add.assert_called_once_with(1, attributes)
+
     def test_record_operation_includes_bank_id_when_enabled(self):
         """Test that bank_id is included in attributes when metrics_include_bank_id is enabled."""
         mock_config = MagicMock()
@@ -322,6 +334,24 @@ class TestGetTokenBucket:
         assert get_token_bucket(50000) == "50k+"
         assert get_token_bucket(100000) == "50k+"
         assert get_token_bucket(1000000) == "50k+"
+
+
+class TestNormalizeHttpEndpoint:
+    """Tests for normalize_http_endpoint (low-cardinality HTTP metric labels)."""
+
+    def test_templates_high_cardinality_segments(self):
+        """Bank ids (incl. non-numeric), UUIDs, and numeric ids collapse to placeholders."""
+        cases = [
+            ("/v1/default/banks/user-1680/memories/recall", "/v1/default/banks/{bank_id}/memories/recall"),
+            ("/v1/default/banks/tenant-acme/memories", "/v1/default/banks/{bank_id}/memories"),
+            ("/v1/default/banks/user-1680", "/v1/default/banks/{bank_id}"),
+            ("/v1/default/banks/3f8c1e2a-1111-2222-3333-444455556666/config", "/v1/default/banks/{bank_id}/config"),
+            ("/v1/default/banks/42/config", "/v1/default/banks/{bank_id}/config"),
+            ("/v1/default/banks", "/v1/default/banks"),
+            ("/health", "/health"),
+        ]
+        for raw, expected in cases:
+            assert normalize_http_endpoint(raw) == expected, raw
 
 
 class TestLLMMetrics:

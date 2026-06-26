@@ -178,6 +178,7 @@ For non-English banks (especially CJK) and the language/extraction-language trad
 | `HINDSIGHT_API_LLM_GROQ_SERVICE_TIER` | Groq service tier: `on_demand`, `flex`, `auto` | `auto` |
 | `HINDSIGHT_API_LLM_OPENAI_SERVICE_TIER` | OpenAI service tier: `flex` for 50% cost savings (OpenAI Flex Processing) | None (default) |
 | `HINDSIGHT_API_LLM_BEDROCK_SERVICE_TIER` | Bedrock service tier: `flex` for 50% cost savings (best-effort inference), `priority` (guaranteed throughput), or `reserved` (provisioned capacity) | Unset (default tier) |
+| `HINDSIGHT_API_LLM_GEMINI_SERVICE_TIER` | Gemini service tier: `flex` for 50% cost savings (best-effort inference) | Unset (default tier) |
 | `HINDSIGHT_API_LLM_EXTRA_BODY` | JSON dict of extra request-body params (e.g. `temperature`, `top_p`, `max_tokens`) merged into every LLM call. Applied across the OpenAI-compatible, Fireworks, Anthropic, Gemini/VertexAI and LiteLLM (incl. Bedrock/Router) providers. Each provider merges them in its own native parameter space, so use that provider's field names (e.g. `max_tokens` for OpenAI/Anthropic vs `max_output_tokens` for Gemini). Also useful for custom model servers (e.g. vLLM `chat_template_kwargs`). | `null` |
 | `HINDSIGHT_API_LLM_DEFAULT_HEADERS` | JSON dict passed as `default_headers` to provider SDK clients. Used by operators routing through proxies / request-tracing middleware (e.g. Cloudflare AI Gateway, Helicone, corporate proxies). Currently wired into the Anthropic provider; other providers can opt in. | `null` |
 | `HINDSIGHT_API_LLM_STRICT_SCHEMA` | Grammar-enforce structured output via `json_schema` `strict: true` instead of the soft "schema-in-prompt + `json_object`" path. Use it with weaker self-hosted models that return prose preambles, markdown ` ```json ` fences, or invalid JSON — which otherwise fail to parse and wedge retain/consolidation. Applies to OpenAI-compatible backends (OpenAI, llama.cpp, vLLM) and LiteLLM; Gemini already enforces its native `response_schema` regardless, and providers without a strict mode ignore it. | `false` |
@@ -205,6 +206,8 @@ export HINDSIGHT_API_LLM_MODEL=gpt-4o
 export HINDSIGHT_API_LLM_PROVIDER=gemini
 export HINDSIGHT_API_LLM_API_KEY=xxxxxxxxxxxx
 export HINDSIGHT_API_LLM_MODEL=gemini-2.0-flash
+# Optional: Use Gemini Flex for 50% cost savings (best-effort inference)
+# export HINDSIGHT_API_LLM_GEMINI_SERVICE_TIER=flex
 
 # Anthropic
 export HINDSIGHT_API_LLM_PROVIDER=anthropic
@@ -351,6 +354,48 @@ export HINDSIGHT_API_LLM_LITELLMROUTER_CONFIG='{
 ```
 
 The config is a credential field — never returned by the bank-config API. Hindsight already retries calls; set `"num_retries": 0` in the Router config to avoid double-retries. Batch APIs aren't supported in router mode.
+
+### Multi-LLM Strategies (failover / round-robin)
+
+Configure additional LLMs **by index** alongside the primary, then choose a strategy for routing across them. This is a provider-agnostic alternative to the LiteLLM Router: the indexed LLMs can be any mix of providers, each fully configured.
+
+The unindexed `HINDSIGHT_API_LLM_*` config is the **primary** (member 1). Extra members are numbered from 1:
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `HINDSIGHT_API_LLM_<n>_PROVIDER` | Provider for extra member `n` (`n` = 1, 2, ...). Presence of this var defines the member; indices must be contiguous from 1. | - |
+| `HINDSIGHT_API_LLM_<n>_API_KEY` | API key for member `n` (required unless the provider needs none). | - |
+| `HINDSIGHT_API_LLM_<n>_MODEL` | Model for member `n`. | Provider default |
+| `HINDSIGHT_API_LLM_<n>_BASE_URL` | Base URL for member `n`. | Provider default |
+| `HINDSIGHT_API_LLM_<n>_REASONING_EFFORT` | Reasoning effort for member `n`. | `HINDSIGHT_API_LLM_REASONING_EFFORT` |
+| `HINDSIGHT_API_LLM_<n>_EXTRA_BODY` / `_DEFAULT_HEADERS` | Per-member JSON overrides. | - |
+| `HINDSIGHT_API_LLM_<n>_BEDROCK_SERVICE_TIER` / `_GEMINI_SERVICE_TIER` | Per-member service tier. | - |
+| `HINDSIGHT_API_LLM_<n>_VERTEXAI_PROJECT_ID` / `_VERTEXAI_REGION` / `_VERTEXAI_SERVICE_ACCOUNT_KEY` | Per-member Vertex AI project, region, and service-account key path (for a `vertexai` member). Each falls back to the global `HINDSIGHT_API_LLM_VERTEXAI_*` when unset. | Global / `us-central1` / ADC |
+| `HINDSIGHT_API_LLM_<n>_LITELLMROUTER_CONFIG` | Per-member LiteLLM Router config JSON (for a `litellmrouter` member). Falls back to the global `HINDSIGHT_API_LLM_LITELLMROUTER_CONFIG` when unset. | - |
+| `HINDSIGHT_API_LLM_STRATEGY` | JSON routing strategy across the chain. Unset = single primary LLM (no change). | - |
+
+The strategy JSON supports two modes:
+
+- `{"mode": "failover"}` — try members in order (primary first); on a member's failure (after its own retries) advance to the next.
+- `{"mode": "round-robin"}` — rotate the starting member per request to spread load, then fall through the rest on failure. Add `"weights": [3, 1, ...]` (positive ints, one per member, primary first) for an **unbalanced** rotation.
+
+```bash
+# Primary OpenAI, failover to Groq then Anthropic
+export HINDSIGHT_API_LLM_PROVIDER=openai
+export HINDSIGHT_API_LLM_API_KEY=sk-...
+export HINDSIGHT_API_LLM_1_PROVIDER=groq
+export HINDSIGHT_API_LLM_1_API_KEY=gsk-...
+export HINDSIGHT_API_LLM_2_PROVIDER=anthropic
+export HINDSIGHT_API_LLM_2_API_KEY=sk-ant-...
+export HINDSIGHT_API_LLM_STRATEGY='{"mode": "failover"}'
+
+# Weighted round-robin: serve the primary 3x as often as member 1
+export HINDSIGHT_API_LLM_STRATEGY='{"mode": "round-robin", "weights": [3, 1]}'
+```
+
+**Per-operation chains.** Each operation can define its own members + strategy with the `RETAIN` / `REFLECT` / `CONSOLIDATION` prefix (e.g. `HINDSIGHT_API_RETAIN_LLM_1_PROVIDER`, `HINDSIGHT_API_RETAIN_LLM_STRATEGY`). A per-operation slot with no indexed members (or no strategy) inherits the global chain.
+
+The indexed members are credential fields — never returned by the bank-config API and server-level only (not per-bank configurable). **Batch retain** runs on the primary member only; failover/round-robin apply to the interactive retain/reflect/consolidation calls.
 
 ### Built-in llama.cpp
 
@@ -981,6 +1026,9 @@ For advanced authentication (JWT, OAuth, multi-tenant schemas), implement a cust
 | `HINDSIGHT_API_BM25_MIN_SCORE` | Minimum BM25 score a row must exceed to enter fusion. Gates out zero-score, non-matching rows on backends (notably `vchord`) whose operator ranks every document instead of pre-filtering to query-term matches. `0` keeps only genuine term matches; raise it to require stronger matches. | `0` |
 | `HINDSIGHT_API_RECALL_MAX_CANDIDATES_PER_SOURCE` | Cap on candidates each retrieval source (semantic, BM25, graph, temporal) contributes to RRF, applied before the global reranker cap. Prevents one over-expanding backend from filling the reranker budget on its own. `0` disables the cap. | `0` |
 | `HINDSIGHT_API_RECALL_STRATEGY_BOOSTS` | Prioritise one or more retrieval sources over the others on recall, as a comma-separated `strategy:level` list (e.g. `graph:high` to strongly favour graph hits, or `graph:high,bm25:low`). Strategies: `semantic`, `bm25`, `graph`, `temporal`. Levels: `low` (gentle — mainly protects the source's candidates from being dropped before reranking), `medium` (moderate preference), `high` (strong — the source dominates the candidate pool and outranks most other matches, only a strong direct match still wins). The boost is applied in two places: before the reranker cap (so favoured candidates survive the `HINDSIGHT_API_RERANKER_MAX_CANDIDATES` budget) and after reranking (to nudge them up the final order); a named level is used because those two stages live on different score scales. Only the strategies you list are boosted — any you omit keep their normal weight (no implicit boost). A strategy written without a level (`graph` or `graph:`) defaults to `medium`. Empty disables the feature. | _(empty)_ |
+| `HINDSIGHT_API_RECENCY_DECAY_FUNCTION` | Shape of the recency boost applied during reranking — how a memory's age is turned into a small freshness adjustment to its final rank. `linear` (default) decays in a straight line from full freshness (today) to a floor reached at `HINDSIGHT_API_RECENCY_DECAY_LINEAR_WINDOW_DAYS`. `exponential` decays by half-life: a memory is treated as neutral (no boost or penalty) at `HINDSIGHT_API_RECENCY_DECAY_HALFLIFE_DAYS`, younger memories are boosted and older ones penalised, with a smooth fade rather than a hard cutoff. `none` disables recency entirely (age never affects ranking). | `linear` |
+| `HINDSIGHT_API_RECENCY_DECAY_LINEAR_WINDOW_DAYS` | For the `linear` decay function: the number of days over which a memory fades from full freshness to the minimum. Only used when `HINDSIGHT_API_RECENCY_DECAY_FUNCTION=linear`. | `365` |
+| `HINDSIGHT_API_RECENCY_DECAY_HALFLIFE_DAYS` | For the `exponential` decay function: the age (in days) at which a memory is considered neutral — younger memories get a recency boost, older ones a penalty. Smaller values favour very recent memories more aggressively. Only used when `HINDSIGHT_API_RECENCY_DECAY_FUNCTION=exponential`. | `90` |
 | `HINDSIGHT_API_MENTAL_MODEL_REFRESH_CONCURRENCY` | Max concurrent mental model refreshes | `8` |
 | `HINDSIGHT_API_ENABLE_MENTAL_MODEL_HISTORY` | Track history of content changes to each mental model (previous content + timestamp), stored one row per change in the `mental_model_history` table. Set to `false` to disable entirely — no history rows are written, reducing storage if audit trails are not needed. **This is how you turn the feature off** (not a zero cap). | `true` |
 | `HINDSIGHT_API_MENTAL_MODEL_HISTORY_MAX_ENTRIES` | Max history rows kept per mental model. On each refresh the previous version is inserted into the `mental_model_history` table and the oldest rows beyond this cap are deleted, so per-model history can't grow without bound. `0` or a negative value **removes the cap** (history then grows with every refresh — unbounded); to turn history off entirely set `HINDSIGHT_API_ENABLE_MENTAL_MODEL_HISTORY=false` instead. | `50` |
@@ -1223,9 +1271,30 @@ Clients that request a parser not in the allowlist receive HTTP 400.
 
 #### Parser: markitdown (default)
 
-Local file-to-markdown conversion using [Microsoft's markitdown](https://github.com/microsoft/markitdown). No external service required.
+Local file-to-markdown conversion using [Microsoft's markitdown](https://github.com/microsoft/markitdown). No external service is required by default.
 
-**Supported formats:** PDF, DOCX, DOC, PPTX, PPT, XLSX, XLS, images (JPG, PNG — OCR), audio (MP3, WAV — transcription), HTML, TXT, MD, CSV.
+**Supported formats:** PDF, DOCX, DOC, PPTX, PPT, XLSX, XLS, images (JPG, PNG — requires optional OCR for text extraction), audio (MP3, WAV — transcription), HTML, TXT, MD, CSV.
+
+For image workloads, MarkItDown can optionally use an OpenAI-compatible OCR/vision endpoint. This is disabled by default. Without it, image uploads fail with an actionable configuration error instead of low-level parser output. When enabled, configure the MarkItDown OCR API key, base URL, and model explicitly; they do not inherit from `HINDSIGHT_API_LLM_*` because MarkItDown uses the OpenAI SDK directly. The selected endpoint must implement OpenAI Chat Completions and the selected model must support image input.
+
+This OCR path uses MarkItDown's image converter hook. It applies to image inputs such as JPG and PNG (and image handling inside converters that consume MarkItDown's `llm_client`), but it does not rasterize scanned PDF pages into images. Scanned PDFs with no text layer may still extract poorly through the default PDF converter. For scanned PDFs or complex document layouts, use an OCR-capable document parser such as `iris` or `llama_parse`, or configure a parser fallback chain like `llama_parse,markitdown`.
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `HINDSIGHT_API_FILE_PARSER_MARKITDOWN_OCR_ENABLED` | Enable MarkItDown image OCR through an OpenAI-compatible OCR/vision endpoint | `false` |
+| `HINDSIGHT_API_FILE_PARSER_MARKITDOWN_OCR_API_KEY` | API key for MarkItDown OCR; required when OCR is enabled | — |
+| `HINDSIGHT_API_FILE_PARSER_MARKITDOWN_OCR_BASE_URL` | OpenAI-compatible Chat Completions base URL for MarkItDown OCR; required when OCR is enabled | — |
+| `HINDSIGHT_API_FILE_PARSER_MARKITDOWN_OCR_MODEL` | OCR/vision model with image-input support; required when OCR is enabled | — |
+| `HINDSIGHT_API_FILE_PARSER_MARKITDOWN_OCR_PROMPT` | OCR prompt passed to MarkItDown's image converter | Built-in OCR prompt |
+
+```bash
+# Configure a dedicated OpenAI-compatible OCR/vision endpoint for MarkItDown OCR
+export HINDSIGHT_API_FILE_PARSER=markitdown
+export HINDSIGHT_API_FILE_PARSER_MARKITDOWN_OCR_ENABLED=true
+export HINDSIGHT_API_FILE_PARSER_MARKITDOWN_OCR_API_KEY=your-vision-api-key
+export HINDSIGHT_API_FILE_PARSER_MARKITDOWN_OCR_BASE_URL=https://vision.example/v1
+export HINDSIGHT_API_FILE_PARSER_MARKITDOWN_OCR_MODEL=ocr-or-vision-model
+```
 
 #### Parser: iris
 
@@ -1374,13 +1443,14 @@ For production deployments, use `s3`, `gcs`, or `azure` to avoid storing large b
 
 ### Observations (Experimental) {#observations}
 
-Observations are deduplicated, evidence-grounded knowledge consolidated from multiple facts. Each observation tracks its supporting memories, a proof count, and a computed freshness trend, and is refined — not overwritten — when new evidence arrives.
+Observations are deduplicated, evidence-grounded knowledge consolidated from multiple facts. Each observation tracks its supporting memories and a proof count, and is refined — not overwritten — when new evidence arrives.
 
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `HINDSIGHT_API_ENABLE_OBSERVATIONS` | Enable observation consolidation | `true` |
 | `HINDSIGHT_API_ENABLE_AUTO_CONSOLIDATION` | Automatically trigger consolidation after retain, delete, and update operations. When `false`, consolidation only runs when explicitly triggered via the [consolidate endpoint](api/operations.md#consolidation). Configurable per bank. | `true` |
 | `HINDSIGHT_API_CONSOLIDATION_RECONCILE_INTERVAL_SECONDS` | Interval for the background sweep that re-schedules consolidation for banks with unconsolidated facts but no consolidation in progress — recovering facts left unscheduled when a consolidation operation failed terminally (e.g. the LLM provider was unavailable). Only applies to banks with auto-consolidation enabled. `0` disables the sweep. | `300` |
+| `HINDSIGHT_API_MENTAL_MODEL_REFRESH_TICK_SECONDS` | How often the background loop checks for cron-scheduled mental models that are due for a refresh. This is only the *check* cadence; the actual schedule is the per-model `trigger.refresh_cron` expression set on the mental model. A due model is refreshed only when it is stale (new memories in its scope since the last refresh). `0` disables the sweep. | `60` |
 | `HINDSIGHT_API_ENABLE_OBSERVATION_HISTORY` | Track history of changes to each observation (previous text/tags/dates + timestamp), stored one row per change in the `observation_history` table. Set to `false` to disable entirely — no history rows are written. **This is how you turn the feature off** (not a zero cap). | `true` |
 | `HINDSIGHT_API_OBSERVATION_HISTORY_MAX_ENTRIES` | Max history rows kept per observation. On each update the previous version is inserted into the `observation_history` table and the oldest rows beyond this cap are deleted, so an often-reinforced observation's history can't grow without bound. `0` or a negative value **removes the cap** (unbounded); to turn history off entirely set `HINDSIGHT_API_ENABLE_OBSERVATION_HISTORY=false` instead. | `50` |
 | `HINDSIGHT_API_CONSOLIDATION_MAX_ATTEMPTS` | Outer retry attempts for the consolidation LLM batch call. Each attempt uses the inner retry budget (`HINDSIGHT_API_CONSOLIDATION_LLM_MAX_RETRIES`). Worst-case API calls per batch = `MAX_ATTEMPTS × (LLM_MAX_RETRIES + 1)`. | `3` |
@@ -1658,6 +1728,7 @@ Hindsight provides OpenTelemetry-based observability for LLM calls, conforming t
 | `HINDSIGHT_API_OTEL_SERVICE_NAME` | Service name for traces | `hindsight-api` |
 | `HINDSIGHT_API_OTEL_DEPLOYMENT_ENVIRONMENT` | Deployment environment name (e.g., development, staging, production) | `development` |
 | `HINDSIGHT_API_METRICS_INCLUDE_BANK_ID` | Include `bank_id` in OTel metric attributes. Enable only for deployments with few banks — high cardinality causes unbounded memory growth. | `false` |
+| `HINDSIGHT_API_METRICS_BACKLOG_ENABLED` | Expose async-operation queue depth and consolidation-backlog gauges (`hindsight_async_operations`, `hindsight_consolidation_backlog`, `hindsight_consolidation_failed`). Runs periodic per-schema `COUNT` queries on a background task. | `false` |
 
 **Features:**
 - Full prompts and completions recorded as events
@@ -1722,6 +1793,7 @@ The Control Plane is the web UI for managing memory banks.
 | `HINDSIGHT_CP_DATAPLANE_API_URL` | URL of the API service | `http://localhost:8888` |
 | `HINDSIGHT_CP_DATAPLANE_API_KEY` | Bearer token the Control Plane sends as `Authorization: Bearer <key>` on every request to the API service. Required when the API service is auth-protected; omit for a public API. | *(none — no `Authorization` header sent)* |
 | `HINDSIGHT_CP_ACCESS_KEY` | Access key to protect the Control Plane UI. When set, users must enter this key to log in. | *(none — auth disabled)* |
+| `HINDSIGHT_CP_MAX_UPLOAD_SIZE` | Maximum size of a single file-upload request the Control Plane accepts before truncating it. Accepts a size string (`100mb`, `1gb`) or a number of bytes. Raise this to upload files larger than the default, and keep it in line with the API's `HINDSIGHT_API_FILE_CONVERSION_MAX_BATCH_SIZE_MB`. | `100mb` |
 | `NEXT_PUBLIC_BASE_PATH` | Base path for Control Plane UI when behind reverse proxy (e.g., `/hindsight`) | `""` (root) |
 
 ```bash

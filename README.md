@@ -70,7 +70,7 @@ docker run -it --pull always --name hindsight --restart unless-stopped -p 8888:8
 >API: http://localhost:8888
 >UI: http://localhost:9999
 
-You can modify the LLM provider by setting `HINDSIGHT_API_LLM_PROVIDER`. Valid options are `openai`, `anthropic`, `gemini`, `groq`, `ollama`, `lmstudio`, and `minimax`. The documentation provides more details on [supported models](https://hindsight.vectorize.io/developer/models).
+You can modify the LLM provider by setting `HINDSIGHT_API_LLM_PROVIDER`. Valid options are `openai`, `anthropic`, `gemini`, `groq`, `ollama`, `lmstudio`, `minimax`, and `atlas` ([Atlas Cloud](https://www.atlascloud.ai/?utm_source=github&utm_medium=link&utm_campaign=hindsight)). The documentation provides more details on [supported models](https://hindsight.vectorize.io/developer/models).
 
 
 
@@ -310,7 +310,7 @@ client.reflect(bank_id="my-bank", query="What should I know about Alice?")
 | **macOS** (Intel / x86_64) | ✅ | ⚠️ | ✅ |
 | **Windows** (x86_64) | ✅ | ✅ | ✅ |
 
-⚠️ Intel Macs: use `hindsight-all-slim` — see the [installation guide](https://docs.hindsight.vectorize.io/docs/developer/installation#supported-platforms) for details.
+⚠️ Intel Macs: use `hindsight-all-slim` — see the [installation guide](https://hindsight.vectorize.io/developer/installation#supported-platforms) for details.
 
 ---
 
