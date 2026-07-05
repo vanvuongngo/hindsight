@@ -84,7 +84,13 @@ def _ctx(threshold: float = 0.97):
         conn=conn,
         memory_engine=types.SimpleNamespace(embeddings=object()),
         bank_id="bank1",
-        config=types.SimpleNamespace(consolidation_dedup_threshold=threshold),
+        # The merge path builds a search_vector UPDATE clause from the text-search
+        # config, so these must be present (production defaults: native/english).
+        config=types.SimpleNamespace(
+            consolidation_dedup_threshold=threshold,
+            text_search_extension="native",
+            text_search_extension_native_language="english",
+        ),
         dedup_llm_config=llm,
         create_text="YouTube content in Uzbek is very rich.",
         create_source_ids=[uuid.uuid4()],
@@ -124,6 +130,16 @@ async def test_dedup_llm_keep_does_not_merge() -> None:
     assert result is None
     llm.call.assert_awaited_once()
     conn.execute.assert_not_called()  # kept distinct → no merge
+
+
+async def test_dedup_llm_missing_action_defaults_to_keep() -> None:
+    kwargs, conn, llm = _ctx()
+    llm.call.return_value = _DedupDecision(reason="underfilled structured response")
+    with _patch_embed(), _patch_probe([_obs("Uzbek content on YouTube is described as very rich.", 0.98)]):
+        result = await _dedup_reconcile_create(**kwargs)
+    assert result is None
+    llm.call.assert_awaited_once()
+    conn.execute.assert_not_called()  # missing action is a conservative no-merge
 
 
 async def test_dedup_llm_merge_folds_into_twin() -> None:
@@ -169,7 +185,13 @@ def _update_ctx(threshold: float = 0.97):
         conn=conn,
         memory_engine=types.SimpleNamespace(embeddings=object()),
         bank_id="bank1",
-        config=types.SimpleNamespace(consolidation_dedup_threshold=threshold),
+        # The merge path builds a search_vector UPDATE clause from the text-search
+        # config, so these must be present (production defaults: native/english).
+        config=types.SimpleNamespace(
+            consolidation_dedup_threshold=threshold,
+            text_search_extension="native",
+            text_search_extension_native_language="english",
+        ),
         dedup_llm_config=llm,
         updated_id=_UPDATED_ID,
         updated_text="Uzbek content on YouTube is very rich and growing.",
